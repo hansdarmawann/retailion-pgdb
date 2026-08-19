@@ -76,9 +76,9 @@ retailion/
 
 ### Prerequisites
 
-- Python 3.9+ 
+- Python 3.12+ 
 - Jupyter Notebook or Jupyter Lab
-- PostgreSQL 12+ (installed and running locally)
+- PostgreSQL 18+ (installed and running locally)
 - Dependencies: psycopg2-binary, sqlalchemy, pandas, matplotlib, seaborn (see requirements.txt)
 
 ### Installation
