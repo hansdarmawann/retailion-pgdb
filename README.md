@@ -1,1 +1,447 @@
-# retailion-pgdb
+# Retailion: Superstore Data Warehouse
+
+A complete **data engineering project** demonstrating a modern data warehouse architecture using the **medallion pattern** (Bronze → Silver → Gold layers) with DuckDB, Python, and Jupyter notebooks.
+
+**Data Source:** [Kaggle Superstore Dataset](https://www.kaggle.com/datasets/vivek468/superstore-dataset-final)
+
+---
+
+## 📊 Project Overview
+
+This project transforms raw superstore transaction data into a clean, analytical star schema optimized for business intelligence and reporting. The pipeline demonstrates industry-standard data engineering practices:
+
+- **Raw data ingestion** (Bronze layer)
+- **Data quality audits & transformation** (Silver layer)  
+- **Dimensional modeling & analytics** (Gold layer)
+
+**Dataset Size:** 9,627 transactions with 21 fields covering customers, products, locations, and financial metrics.
+
+---
+
+## 🏗️ Architecture: Medallion Pattern
+
+The medallion architecture organizes data into three layers:
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                     DATA WAREHOUSE LAYERS                    │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  BRONZE LAYER          SILVER LAYER          GOLD LAYER      │
+│  ─────────────         ─────────────         ──────────      │
+│                                                              │
+│  • Raw CSV data       • Cleaned data        • Star Schema    │
+│  • No transforms      • Type-casted         • Dimensions     │
+│  • Minimal QA         • Audited & QA'd      • Facts          │
+│  • Audit trail        • Standardized        • Optimized      │
+│                       • EDA complete       • Analytics-ready │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Layer Details
+
+| Layer | Purpose | Key Operations | Output |
+|-------|---------|-----------------|--------|
+| **Bronze** | Raw landing zone | CSV → Table, minimal errors | `bronze.superstore` |
+| **Silver** | Trusted zone | Cleaning, QA, exploration | `silver.superstore` |
+| **Gold** | Analytics zone | Dimensional modeling | Star schema (dims + facts) |
+
+---
+
+## 📁 Project Structure
+
+```
+retailion/
+├── README.md                          # This file
+├── requirements.txt                   # Python dependencies
+│
+├── notebooks/                         # Jupyter notebooks (layer-by-layer)
+│   ├── 01_bronze.ipynb               # Raw data ingestion
+│   ├── 02_silver.ipynb               # Data cleaning & EDA
+│   └── 03_gold.ipynb                 # Dimensional modeling & analytics
+│
+└── data/                              # Data directory
+    ├── Sample - Superstore.csv       # Raw CSV source (9,627 rows)
+    └── retailion.duckdb              # DuckDB database (auto-created)
+```
+
+---
+
+## 🚀 Quick Start
+
+### Prerequisites
+
+- Python 3.9+ 
+- Jupyter Notebook or Jupyter Lab
+- DuckDB, pandas, matplotlib, seaborn (see requirements.txt)
+
+### Installation
+
+```bash
+# 1. Clone/navigate to project directory
+cd retailion
+
+# 2. Install dependencies
+pip install -r requirements.txt
+
+# 3. Start Jupyter
+jupyter notebook
+```
+
+### Running the Pipeline
+
+Execute notebooks in order:
+
+1. **`01_bronze.ipynb`** → Loads raw CSV into DuckDB
+2. **`02_silver.ipynb`** → Cleans data, performs QA, explores patterns
+3. **`03_gold.ipynb`** → Builds star schema, validates, runs sample queries
+
+**Total Runtime:** ~5-10 minutes (mostly for visualizations in silver layer)
+
+---
+
+## 📓 Notebook Descriptions
+
+### 1️⃣ Bronze Layer: `01_bronze.ipynb`
+
+**Objective:** Ingest raw CSV data with minimal transformation.
+
+**What it does:**
+- Connects to DuckDB database
+- Loads CSV with auto-type detection
+- Creates `bronze.superstore` table (9,627 rows × 21 columns)
+- Previews ingested data
+
+**Output:** 
+- DuckDB schema: `bronze`
+- Table: `bronze.superstore`
+
+**Key Code:**
+```sql
+CREATE OR REPLACE TABLE bronze.superstore AS 
+SELECT * FROM read_csv_auto(
+    '../data/Sample - Superstore.csv', 
+    header=True,
+    ignore_errors=True
+);
+```
+
+---
+
+### 2️⃣ Silver Layer: `02_silver.ipynb`
+
+**Objective:** Clean, validate, and explore data quality.
+
+**What it does:**
+
+1. **Data Quality Audits**
+   - ✅ Missing values check (0 nulls found)
+   - ✅ Duplicate detection (no duplicates)
+   - ✅ Type inspection (21 fields properly typed)
+
+2. **Exploratory Data Analysis (EDA)**
+   - Numerical distributions (sales, quantity, discount, profit)
+   - Categorical value counts (segment, region, category, etc.)
+   - Outlier detection via boxplots
+   - Statistical summaries
+
+3. **Transformations Applied**
+   - Column name standardization (snake_case)
+   - Explicit type casting
+   - NULL handling (postal codes → '00000')
+   - Whitespace trimming (customer names)
+   - Audit timestamps (`ingested_at`)
+
+**Output:**
+- DuckDB schema: `silver`
+- Table: `silver.superstore` (9,627 rows × 22 columns with standardized types)
+
+**Key Transformations:**
+```sql
+CREATE OR REPLACE TABLE silver.superstore AS
+SELECT 
+    CAST("Row ID" AS INT) AS row_id,
+    CAST("Order Date" AS DATE) AS order_date,
+    TRIM("Customer Name") AS customer_name,
+    COALESCE(CAST("Postal Code" AS VARCHAR), '00000') AS postal_code,
+    CAST("Sales" AS DOUBLE) AS sales,
+    CAST("Profit" AS DOUBLE) AS profit,
+    CURRENT_TIMESTAMP AS ingested_at
+FROM bronze.superstore;
+```
+
+---
+
+### 3️⃣ Gold Layer: `03_gold.ipynb`
+
+**Objective:** Build analytical star schema optimized for BI tools.
+
+**What it does:**
+
+1. **Creates Dimension Tables**
+   - `dim_customers` (787 unique customers)
+   - `dim_products` (1,832 unique products)
+   - `dim_location` (628 unique locations with surrogate key)
+   - `dim_date` (1,430 unique dates with temporal attributes)
+
+2. **Creates Fact Table**
+   - `fact_sales` (9,627 transaction records)
+   - Stores measures: sales, quantity, discount, profit
+   - References all dimensions via foreign keys
+
+3. **Validates Data Integrity**
+   - Row count matching (silver → fact = 1:1)
+   - Dimension cardinality verification
+   - Foreign key verification
+
+4. **Demonstrates Analytical Queries**
+   - Sales by customer segment
+   - Sales by region and month
+   - Top 10 products by profit
+
+**Output:**
+- DuckDB schema: `gold`
+- Tables: 
+  - `gold.dim_customers`
+  - `gold.dim_products`
+  - `gold.dim_location`
+  - `gold.dim_date`
+  - `gold.fact_sales`
+
+**Star Schema:**
+```
+                    ┌─────────────────┐
+                    │  dim_customers  │
+                    │ (787 rows)      │
+                    └────────┬────────┘
+                             │
+        ┌────────────────────┼────────────────────┐
+        │                    │                    │
+   ┌────▼───┐          ┌──────▼──────┐     ┌──────▼──────┐
+   │dim_    │          │  dim_       │     │  dim_date   │
+   │products│          │ location    │     │(1430 rows)  │
+   │(1832)  │          │(628 rows)   │     │             │
+   └────┬───┘          └──────┬──────┘     └──────┬──────┘
+        │                    │                    │
+        └────────────────────┼────────────────────┘
+                             │
+                    ┌────────▼────────┐
+                    │  fact_sales     │
+                    │  (9,627 rows)   │
+                    └─────────────────┘
+```
+
+---
+
+## 📊 Data Model & Schema
+
+### Dimension Tables
+
+#### `dim_customers`
+| Column | Type | Notes |
+|--------|------|-------|
+| customer_id | VARCHAR | Primary key |
+| customer_name | VARCHAR | Customer name |
+| segment | VARCHAR | Consumer, Corporate, Home Office |
+
+#### `dim_products`
+| Column | Type | Notes |
+|--------|------|-------|
+| product_id | VARCHAR | Primary key |
+| product_name | VARCHAR | Product name |
+| category | VARCHAR | Furniture, Office Supplies, Technology |
+| sub_category | VARCHAR | Detailed product category |
+
+#### `dim_location`
+| Column | Type | Notes |
+|--------|------|-------|
+| location_id | INT | Surrogate key (auto-generated) |
+| country | VARCHAR | United States |
+| region | VARCHAR | West, East, Central, South |
+| state | VARCHAR | 2-letter state code |
+| city | VARCHAR | City name |
+| postal_code | VARCHAR | Postal code |
+
+#### `dim_date`
+| Column | Type | Notes |
+|--------|------|-------|
+| date_key | DATE | Primary key |
+| year | INT | Year (2016-2017) |
+| month | INT | Month (1-12) |
+| day | INT | Day of month |
+| quarter | INT | Quarter (Q1-Q4) |
+| day_name | VARCHAR | Monday, Tuesday, etc. |
+| month_name | VARCHAR | January, February, etc. |
+| is_weekend | BOOLEAN | TRUE for Saturday/Sunday |
+
+### Fact Table
+
+#### `fact_sales`
+| Column | Type | Role | Notes |
+|--------|------|------|-------|
+| row_id | INT | ID | Unique transaction line item |
+| order_id | VARCHAR | ID | Order identifier |
+| order_date | DATE | FK | Links to dim_date |
+| ship_date | DATE | FK | Links to dim_date |
+| customer_id | VARCHAR | FK | Links to dim_customers |
+| product_id | VARCHAR | FK | Links to dim_products |
+| location_id | INT | FK | Links to dim_location |
+| ship_mode | VARCHAR | Attribute | First Class, Second Class, etc. |
+| **sales** | DOUBLE | **Measure** | **Revenue per line item** |
+| **quantity** | INT | **Measure** | **Units sold** |
+| **discount** | DOUBLE | **Measure** | **Discount applied (0-1)** |
+| **profit** | DOUBLE | **Measure** | **Net profit (can be negative)** |
+
+---
+
+## 🔍 Key Data Insights
+
+### Data Quality
+✅ **Excellent Quality**
+- **Completeness:** 9,627 rows × 21 columns, 0 nulls
+- **Uniqueness:** No duplicate records
+- **Validity:** All dates parseable, numerics in expected ranges
+
+### Business Dimensions
+- **Customers:** 787 unique customers across 4 segments (78% Consumer)
+- **Products:** 1,832 unique products in 3 categories (Tech dominates)
+- **Locations:** 628 unique locations in 4 US regions (West largest)
+- **Time Range:** 4 years (2016-2017) with 1,430 distinct transaction dates
+
+### Financial Patterns
+- **Sales Range:** $0 - $22,638 per transaction (right-skewed distribution)
+- **Profitability:** 9,627 transactions; some orders unprofitable (negative profit)
+- **Discounting:** Most orders have 0% discount; heavy discounts rare
+- **Quantity:** Most orders are 1-3 items (bulk orders less common)
+
+### Outliers
+- **High-value orders:** Few transactions > $10,000 (legitimate high-value sales)
+- **Bulk orders:** Some orders > 10 items (wholesale or bulk customers)
+- **Loss-making orders:** Negative profit cases suggest pricing/cost issues worth investigating
+
+---
+
+## 💾 Database & Technology Stack
+
+| Component | Technology | Purpose |
+|-----------|-----------|---------|
+| **Database** | DuckDB | Embedded SQL database (no server required) |
+| **Processing** | Python + Pandas | Data transformation & analysis |
+| **Visualization** | Matplotlib + Seaborn | EDA charts & distributions |
+| **Notebooks** | Jupyter | Interactive analysis & documentation |
+| **Version Control** | Git | Change tracking |
+
+### Why DuckDB?
+- ✅ Lightweight (single file: `retailion.duckdb`)
+- ✅ SQL support (standard queries, easy migration to Postgres/Snowflake)
+- ✅ Excellent Pandas integration
+- ✅ No server setup required
+- ✅ In-process execution (fast for analytical queries)
+
+---
+
+## 📦 Dependencies
+
+```
+duckdb              # Database engine
+numpy               # Numerical computing
+pandas              # Data manipulation
+seaborn             # Statistical visualization
+matplotlib          # Plotting library
+```
+
+Install all at once:
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+## 🎯 Key Learning Outcomes
+
+This project demonstrates:
+
+1. **Medallion Architecture** - Industry-standard data warehouse pattern
+2. **Data Quality Practices** - Audits, validation, documentation
+3. **Exploratory Data Analysis** - Statistical and visual techniques
+4. **Dimensional Modeling** - Star schema design for analytics
+5. **SQL Proficiency** - Complex queries, joins, aggregations
+6. **Python Data Stack** - Pandas, DuckDB, visualization libraries
+7. **Jupyter as Documentation** - Narrative notebooks with code & insights
+
+---
+
+## 🔮 Future Enhancements
+
+### Short Term
+- [ ] Add data quality KPIs (row counts, null %, duplicates %)
+- [ ] Create aggregated fact tables (daily_sales, monthly_sales)
+- [ ] Add slowly-changing dimensions (SCD Type 2) for products
+- [ ] Implement incremental loading logic
+
+### Medium Term
+- [ ] Migrate from notebooks to Python modules
+- [ ] Add orchestration (Airflow, dbt, or Prefect)
+- [ ] Connect BI tool (Tableau, Power BI, Looker, Metabase)
+- [ ] Add data validation framework (Great Expectations)
+- [ ] Implement monitoring & alerting
+
+### Long Term
+- [ ] Scale to cloud data warehouse (Snowflake, BigQuery, Redshift)
+- [ ] Build ML pipeline for demand forecasting
+- [ ] Implement real-time data ingestion
+- [ ] Add data governance & lineage tracking (OpenLineage)
+- [ ] Create self-service analytics platform
+
+---
+
+## 🚀 Next Steps
+
+### For Data Engineers
+1. Convert notebooks to production Python scripts
+2. Set up workflow orchestration (Airflow/dbt)
+3. Add data quality tests using Great Expectations
+4. Implement incremental data loads
+
+### For Data Analysts
+1. Connect DuckDB to your BI tool
+2. Build dashboards on the gold layer star schema
+3. Run ad-hoc exploratory queries
+4. Create KPI reports
+
+### For Data Scientists
+1. Use the gold layer as training data source
+2. Analyze customer segments with clustering
+3. Build demand forecasting models
+4. Analyze profitability drivers
+
+---
+
+## 📖 Additional Resources
+
+- [Kaggle Dataset](https://www.kaggle.com/datasets/vivek468/superstore-dataset-final)
+- [DuckDB Documentation](https://duckdb.org/docs/)
+- [Medallion Architecture Concept](https://www.databricks.com/blog/2022/06/24/multi-hop-architecture-is-pat-of-modern-data-platforms.html)
+- [Star Schema Design](https://learn.microsoft.com/en-us/power-bi/guidance/star-schema)
+- [Dimensional Modeling Fundamentals](https://www.kimballgroup.com/)
+
+---
+
+## 📝 License
+
+This project uses publicly available Kaggle dataset. Feel free to use this code for learning and educational purposes.
+
+---
+
+## 👤 Author
+
+Created as a comprehensive data engineering project demonstrating modern data warehouse practices.
+
+**Last Updated:** July 2026
+
+---
+
+**Questions? Ideas? Found a bug?**
+
+Feel free to check the notebooks for detailed explanations of each step, or refer to the data model section above for schema details.
