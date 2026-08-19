@@ -8,8 +8,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# DuckDB database files (no longer used)
-*.duckdb
+# PostgreSQL database files (server-managed)
+# Local database files should not be committed
 
 # Python
 venv/

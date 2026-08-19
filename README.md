@@ -118,6 +118,59 @@ Execute notebooks in order:
 
 **Important:** Ensure your `.env` file is configured with PostgreSQL credentials before running.
 
+### Verify PostgreSQL Setup
+
+Before running notebooks, verify PostgreSQL is ready:
+
+```bash
+# Test PostgreSQL connection
+psql -h localhost -U postgres -d postgres -c "SELECT version();"
+
+# Create the database if it doesn't exist
+createdb retailion
+
+# Verify database was created
+psql -l | grep retailion
+```
+
+If you get connection errors, check:
+- ✅ PostgreSQL service is running (`sudo systemctl status postgresql` on Linux)
+- ✅ Correct host/port in `.env` file (default: localhost:5432)
+- ✅ Database user exists and password is correct
+- ✅ Database `retailion` exists (`createdb retailion`)
+
+---
+
+## 🔧 Troubleshooting
+
+### "FATAL: role 'postgres' does not exist"
+**Solution:** Check PostgreSQL installation. On Windows, default user might be different. Verify with:
+```bash
+psql -U postgres  # Try default user
+psql -U [your_username]  # Or use your Windows username
+```
+
+### "ERROR: could not connect to server"
+**Solution:** PostgreSQL service not running:
+- **Windows:** Start PostgreSQL from Services or `net start postgresql-x64-15`
+- **macOS:** `brew services start postgresql`
+- **Linux:** `sudo systemctl start postgresql`
+
+### "ModuleNotFoundError: No module named 'psycopg2'"
+**Solution:** Install dependencies:
+```bash
+pip install -r requirements.txt
+```
+
+### "UNIQUE violation on bronze.superstore"
+**Solution:** Table already exists. This is normal on re-runs. The notebook uses `if_exists='replace'` to overwrite. If you get an error:
+```sql
+DROP TABLE IF EXISTS bronze.superstore CASCADE;
+```
+
+### "No missing values found" but data looks incomplete
+**Solution:** Check the `.env` file has correct PostgreSQL credentials. The bronze layer loads raw CSV as-is; quality checks happen in silver layer.
+
 ---
 
 ## 📓 Notebook Descriptions
@@ -379,6 +432,73 @@ pip install -r requirements.txt
 
 ---
 
+## 📈 DuckDB → PostgreSQL Migration
+
+### What Changed
+
+This project was originally built with **DuckDB** (an in-process SQL database) but was migrated to **PostgreSQL** (a client-server SQL database). Here's what shifted:
+
+| Aspect | DuckDB | PostgreSQL |
+|--------|--------|-----------|
+| **Architecture** | In-process (embedded) | Client-Server (runs on a server) |
+| **Data Location** | Single `.duckdb` file | Managed by running PostgreSQL service |
+| **Connection** | Direct file access via Python | Network connection (host:port) |
+| **Python Library** | `duckdb` module + `read_csv_auto()` | `psycopg2` + `SQLAlchemy` |
+| **CSV Ingestion** | DuckDB's native CSV reader | Pandas → SQLAlchemy → PostgreSQL |
+| **Best For** | Laptop analytics, one-off queries, embedded OLAP | Production warehouse, multiple users, ACID compliance |
+| **Scalability** | Single machine | Multiple users, backups, replication |
+
+### Why PostgreSQL
+
+✅ **Production-Ready** - Industry-standard for data warehouses and analytics  
+✅ **Concurrent Access** - Multiple analysts can query simultaneously  
+✅ **ACID Compliance** - Data integrity guaranteed  
+✅ **BI Tool Integration** - Native support in Tableau, Power BI, Looker, etc.  
+✅ **Ecosystem** - Rich tooling for backups, replication, monitoring  
+✅ **Long-term Sustainability** - Widely deployed in enterprises  
+
+### Code Changes
+
+**Before (DuckDB):**
+```python
+import duckdb
+conn = duckdb.connect('retailion.duckdb')
+df = conn.execute("SELECT * FROM bronze.superstore").fetch_df()
+conn.execute("CREATE TABLE silver.superstore AS SELECT ...")
+```
+
+**After (PostgreSQL):**
+```python
+from sqlalchemy import create_engine
+engine = create_engine("postgresql+psycopg2://user:pass@localhost:5432/retailion")
+df = pd.read_sql("SELECT * FROM bronze.superstore", engine)
+df.to_sql('superstore', engine, schema='silver', if_exists='replace')
+```
+
+### Setup Difference
+
+**DuckDB:** Just run code, database file created automatically  
+**PostgreSQL:** Requires:
+1. PostgreSQL server installed and running
+2. Database created (`createdb retailion`)
+3. Connection parameters in `.env` file
+
+### When to Use Each
+
+| Use Case | DuckDB | PostgreSQL |
+|----------|--------|-----------|
+| **Local development/prototyping** | ✅ Excellent | ✅ Good |
+| **Team collaboration** | ❌ Difficult (file-based) | ✅ Perfect |
+| **Production data warehouse** | ❌ Not recommended | ✅ Industry standard |
+| **Multi-user analytics** | ❌ Single user only | ✅ Concurrent access |
+| **Cloud deployment** | ⚠️ Possible but tricky | ✅ Easy (RDS, etc.) |
+| **Embedded analytics** | ✅ Purpose-built | ❌ Overkill |
+| **Complex ETL pipelines** | ✅ Good for pure OLAP | ✅ Excellent (with orchestration) |
+
+**For this project:** PostgreSQL was chosen because it's the industry-standard approach for building scalable, production-grade data warehouses that multiple analysts can access simultaneously.
+
+---
+
 ## 🎯 Key Learning Outcomes
 
 This project demonstrates:
@@ -388,8 +508,48 @@ This project demonstrates:
 3. **Exploratory Data Analysis** - Statistical and visual techniques
 4. **Dimensional Modeling** - Star schema design for analytics
 5. **SQL Proficiency** - Complex queries, joins, aggregations
-6. **Python Data Stack** - Pandas, DuckDB, visualization libraries
+6. **Python Data Stack** - Pandas, PostgreSQL, SQLAlchemy, visualization libraries
 7. **Jupyter as Documentation** - Narrative notebooks with code & insights
+
+---
+
+## ⚡ Performance & Optimization
+
+### Current Performance
+
+- **Bronze Layer:** ~10 seconds (CSV ingestion via Pandas)
+- **Silver Layer:** ~5-8 seconds (type casting, EDA visualizations)
+- **Gold Layer:** ~3-5 seconds (dimension/fact table creation)
+- **Example Queries:** <100ms each
+
+### Optimization Opportunities
+
+For larger datasets or production use:
+
+1. **Add Indexes** (improves query speed)
+   ```sql
+   CREATE INDEX idx_fact_sales_customer ON gold.fact_sales(customer_id);
+   CREATE INDEX idx_fact_sales_date ON gold.fact_sales(order_date);
+   CREATE INDEX idx_dim_location ON gold.dim_location(region, state);
+   ```
+
+2. **Partition Large Tables** (for very large datasets)
+   ```sql
+   -- Partition fact table by year for faster queries
+   CREATE TABLE gold.fact_sales_2016 PARTITION OF gold.fact_sales
+       FOR VALUES FROM ('2016-01-01') TO ('2017-01-01');
+   ```
+
+3. **Materialized Views** (pre-aggregate heavy queries)
+   ```sql
+   CREATE MATERIALIZED VIEW gold.vw_sales_by_region AS
+   SELECT region, SUM(sales) FROM gold.fact_sales
+   GROUP BY region;
+   ```
+
+4. **Batch Processing** (for incremental loads)
+   - Use `INSERT INTO` instead of `replace` to add new data
+   - Track processed rows with timestamps
 
 ---
 
@@ -400,6 +560,7 @@ This project demonstrates:
 - [ ] Create aggregated fact tables (daily_sales, monthly_sales)
 - [ ] Add slowly-changing dimensions (SCD Type 2) for products
 - [ ] Implement incremental loading logic
+- [ ] Add database indexes for common queries
 
 ### Medium Term
 - [ ] Migrate from notebooks to Python modules
@@ -407,6 +568,7 @@ This project demonstrates:
 - [ ] Connect BI tool (Tableau, Power BI, Looker, Metabase)
 - [ ] Add data validation framework (Great Expectations)
 - [ ] Implement monitoring & alerting
+- [ ] Create materialized views for common aggregations
 
 ### Long Term
 - [ ] Scale to cloud data warehouse (Snowflake, BigQuery, Redshift)
@@ -426,7 +588,7 @@ This project demonstrates:
 4. Implement incremental data loads
 
 ### For Data Analysts
-1. Connect DuckDB to your BI tool
+1. Connect PostgreSQL to your BI tool
 2. Build dashboards on the gold layer star schema
 3. Run ad-hoc exploratory queries
 4. Create KPI reports
