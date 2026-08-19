@@ -1,6 +1,6 @@
 # Retailion: Superstore Data Warehouse
 
-A complete **data engineering project** demonstrating a modern data warehouse architecture using the **medallion pattern** (Bronze → Silver → Gold layers) with DuckDB, Python, and Jupyter notebooks.
+A complete **data engineering project** demonstrating a modern data warehouse architecture using the **medallion pattern** (Bronze → Silver → Gold layers) with PostgreSQL, Python, and Jupyter notebooks.
 
 **Data Source:** [Kaggle Superstore Dataset](https://www.kaggle.com/datasets/vivek468/superstore-dataset-final)
 
@@ -54,7 +54,10 @@ The medallion architecture organizes data into three layers:
 ```
 retailion/
 ├── README.md                          # This file
+├── MIGRATION_GUIDE.md                 # DuckDB → PostgreSQL migration notes
 ├── requirements.txt                   # Python dependencies
+├── .env.example                       # PostgreSQL connection template
+├── .gitignore                         # Git ignore rules
 │
 ├── notebooks/                         # Jupyter notebooks (layer-by-layer)
 │   ├── 01_bronze.ipynb               # Raw data ingestion
@@ -62,9 +65,10 @@ retailion/
 │   └── 03_gold.ipynb                 # Dimensional modeling & analytics
 │
 └── data/                              # Data directory
-    ├── Sample - Superstore.csv       # Raw CSV source (9,627 rows)
-    └── retailion.duckdb              # DuckDB database (auto-created)
+    └── Sample - Superstore.csv       # Raw CSV source (9,627 rows)
 ```
+
+**Note:** PostgreSQL stores all data on a running server. The `.env` file contains connection credentials and should not be committed to version control.
 
 ---
 
@@ -74,7 +78,8 @@ retailion/
 
 - Python 3.9+ 
 - Jupyter Notebook or Jupyter Lab
-- DuckDB, pandas, matplotlib, seaborn (see requirements.txt)
+- PostgreSQL 12+ (installed and running locally)
+- Dependencies: psycopg2-binary, sqlalchemy, pandas, matplotlib, seaborn (see requirements.txt)
 
 ### Installation
 
@@ -82,10 +87,22 @@ retailion/
 # 1. Clone/navigate to project directory
 cd retailion
 
-# 2. Install dependencies
+# 2. Ensure PostgreSQL is running
+# On Windows: Start PostgreSQL service
+# On macOS: brew services start postgresql
+# On Linux: sudo systemctl start postgresql
+
+# 3. Create database
+createdb retailion
+
+# 4. Configure environment
+cp .env.example .env
+# Edit .env with your PostgreSQL credentials
+
+# 5. Install dependencies
 pip install -r requirements.txt
 
-# 3. Start Jupyter
+# 6. Start Jupyter
 jupyter notebook
 ```
 
@@ -93,11 +110,13 @@ jupyter notebook
 
 Execute notebooks in order:
 
-1. **`01_bronze.ipynb`** → Loads raw CSV into DuckDB
+1. **`01_bronze.ipynb`** → Loads raw CSV into PostgreSQL bronze schema
 2. **`02_silver.ipynb`** → Cleans data, performs QA, explores patterns
 3. **`03_gold.ipynb`** → Builds star schema, validates, runs sample queries
 
 **Total Runtime:** ~5-10 minutes (mostly for visualizations in silver layer)
+
+**Important:** Ensure your `.env` file is configured with PostgreSQL credentials before running.
 
 ---
 
@@ -108,23 +127,19 @@ Execute notebooks in order:
 **Objective:** Ingest raw CSV data with minimal transformation.
 
 **What it does:**
-- Connects to DuckDB database
-- Loads CSV with auto-type detection
+- Connects to PostgreSQL database
+- Loads CSV using pandas and writes to PostgreSQL via SQLAlchemy
 - Creates `bronze.superstore` table (9,627 rows × 21 columns)
 - Previews ingested data
 
 **Output:** 
-- DuckDB schema: `bronze`
+- PostgreSQL schema: `bronze`
 - Table: `bronze.superstore`
 
 **Key Code:**
-```sql
-CREATE OR REPLACE TABLE bronze.superstore AS 
-SELECT * FROM read_csv_auto(
-    '../data/Sample - Superstore.csv', 
-    header=True,
-    ignore_errors=True
-);
+```python
+df = pd.read_csv('../data/Sample - Superstore.csv')
+df.to_sql('superstore', engine, schema='bronze', if_exists='replace', index=False)
 ```
 
 ---
@@ -154,19 +169,19 @@ SELECT * FROM read_csv_auto(
    - Audit timestamps (`ingested_at`)
 
 **Output:**
-- DuckDB schema: `silver`
+- PostgreSQL schema: `silver`
 - Table: `silver.superstore` (9,627 rows × 22 columns with standardized types)
 
 **Key Transformations:**
 ```sql
-CREATE OR REPLACE TABLE silver.superstore AS
+CREATE TABLE silver.superstore AS
 SELECT 
-    CAST("Row ID" AS INT) AS row_id,
+    CAST("Row ID" AS INTEGER) AS row_id,
     CAST("Order Date" AS DATE) AS order_date,
     TRIM("Customer Name") AS customer_name,
     COALESCE(CAST("Postal Code" AS VARCHAR), '00000') AS postal_code,
-    CAST("Sales" AS DOUBLE) AS sales,
-    CAST("Profit" AS DOUBLE) AS profit,
+    CAST("Sales" AS DOUBLE PRECISION) AS sales,
+    CAST("Profit" AS DOUBLE PRECISION) AS profit,
     CURRENT_TIMESTAMP AS ingested_at
 FROM bronze.superstore;
 ```
@@ -201,7 +216,7 @@ FROM bronze.superstore;
    - Top 10 products by profit
 
 **Output:**
-- DuckDB schema: `gold`
+- PostgreSQL schema: `gold`
 - Tables: 
   - `gold.dim_customers`
   - `gold.dim_products`
@@ -326,35 +341,41 @@ FROM bronze.superstore;
 
 | Component | Technology | Purpose |
 |-----------|-----------|---------|
-| **Database** | DuckDB | Embedded SQL database (no server required) |
+| **Database** | PostgreSQL | Production-grade SQL database with server |
+| **ORM/Connector** | SQLAlchemy + psycopg2 | Python database abstraction layer |
 | **Processing** | Python + Pandas | Data transformation & analysis |
 | **Visualization** | Matplotlib + Seaborn | EDA charts & distributions |
 | **Notebooks** | Jupyter | Interactive analysis & documentation |
 | **Version Control** | Git | Change tracking |
 
-### Why DuckDB?
-- ✅ Lightweight (single file: `retailion.duckdb`)
-- ✅ SQL support (standard queries, easy migration to Postgres/Snowflake)
-- ✅ Excellent Pandas integration
-- ✅ No server setup required
-- ✅ In-process execution (fast for analytical queries)
+### Why PostgreSQL?
+- ✅ Production-ready (industry-standard data warehouse database)
+- ✅ SQL support (standard ANSI SQL with extensions)
+- ✅ Excellent Pandas integration via SQLAlchemy
+- ✅ Scalable (handles large datasets efficiently)
+- ✅ ACID compliance (data integrity guarantees)
+- ✅ Rich ecosystem (BI tools, migration tools, extensions)
 
 ---
 
 ## 📦 Dependencies
 
 ```
-duckdb              # Database engine
+psycopg2-binary     # PostgreSQL adapter for Python
+sqlalchemy          # SQL toolkit & ORM
 numpy               # Numerical computing
 pandas              # Data manipulation
 seaborn             # Statistical visualization
 matplotlib          # Plotting library
+python-dotenv       # Environment variable management
 ```
 
 Install all at once:
 ```bash
 pip install -r requirements.txt
 ```
+
+**Note:** PostgreSQL 12+ must be installed separately and running on your system.
 
 ---
 
@@ -421,10 +442,12 @@ This project demonstrates:
 ## 📖 Additional Resources
 
 - [Kaggle Dataset](https://www.kaggle.com/datasets/vivek468/superstore-dataset-final)
-- [DuckDB Documentation](https://duckdb.org/docs/)
+- [PostgreSQL Documentation](https://www.postgresql.org/docs/)
+- [SQLAlchemy Documentation](https://docs.sqlalchemy.org/)
 - [Medallion Architecture Concept](https://www.databricks.com/blog/2022/06/24/multi-hop-architecture-is-pat-of-modern-data-platforms.html)
 - [Star Schema Design](https://learn.microsoft.com/en-us/power-bi/guidance/star-schema)
 - [Dimensional Modeling Fundamentals](https://www.kimballgroup.com/)
+- [Migration Guide](MIGRATION_GUIDE.md) - Details on DuckDB → PostgreSQL changes
 
 ---
 
@@ -438,7 +461,7 @@ This project uses publicly available Kaggle dataset. Feel free to use this code 
 
 Created as a comprehensive data engineering project demonstrating modern data warehouse practices.
 
-**Last Updated:** July 2026
+**Last Updated:** August 2026 (PostgreSQL migration)
 
 ---
 

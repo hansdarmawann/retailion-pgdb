@@ -1,0 +1,17 @@
+# Environment variables
+.env
+.env.local
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# DuckDB database files (no longer used)
+*.duckdb
+
+# Python
+venv/
+env/
+.venv
