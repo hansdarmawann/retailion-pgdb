@@ -64,12 +64,14 @@ def run_silver(engine, run_id: str, source_file: str, start_date=None, end_date=
         connection.execute(text("""
             CREATE SCHEMA IF NOT EXISTS quarantine;
             CREATE TABLE IF NOT EXISTS quarantine.superstore_invalid AS
-            SELECT *, CAST(NULL AS UUID) AS run_id, CAST(NULL AS TEXT) AS reason
+            SELECT *, CAST(NULL AS TEXT) AS reason
             FROM silver.superstore WITH NO DATA;
+            ALTER TABLE quarantine.superstore_invalid
+                ADD COLUMN IF NOT EXISTS reason TEXT;
         """))
         connection.execute(text("""
             INSERT INTO quarantine.superstore_invalid
-            SELECT s.*, CAST(:run_id AS UUID),
+            SELECT s.*,
                    CASE WHEN quantity <= 0 THEN 'quantity <= 0'
                         WHEN discount NOT BETWEEN 0 AND 1 THEN 'discount outside [0,1]'
                         WHEN sales < 0 THEN 'sales < 0' END
@@ -93,7 +95,7 @@ def run_gold(engine) -> int:
     SELECT ROW_NUMBER() OVER (ORDER BY customer_id)::INTEGER AS customer_key,
            customer_id, customer_name, segment, ingested_at
     FROM (
-        SELECT DISTINCT ON (customer_id) customer_id, customer_name, segment
+        SELECT DISTINCT ON (customer_id) customer_id, customer_name, segment, ingested_at
         FROM silver.superstore
         ORDER BY customer_id, ingested_at DESC
     ) latest_customers;
@@ -102,7 +104,7 @@ def run_gold(engine) -> int:
 
     CREATE TABLE gold.dim_customers_scd2 AS
     SELECT customer_key, customer_id, customer_name, segment,
-           ingested_at AS valid_from,
+           history.ingested_at AS valid_from,
            CAST(NULL AS TIMESTAMPTZ) AS valid_to,
            TRUE AS is_current
     FROM gold.dim_customers c
@@ -114,7 +116,7 @@ def run_gold(engine) -> int:
     SELECT ROW_NUMBER() OVER (ORDER BY product_id)::INTEGER AS product_key,
            product_id, product_name, category, sub_category, ingested_at
     FROM (
-        SELECT DISTINCT ON (product_id) product_id, product_name, category, sub_category
+        SELECT DISTINCT ON (product_id) product_id, product_name, category, sub_category, ingested_at
         FROM silver.superstore
         ORDER BY product_id, ingested_at DESC
     ) latest_products;
@@ -177,14 +179,17 @@ def validate(engine, silver_count: int, gold_count: int, run_id: str) -> None:
             "SELECT COUNT(*) = 0 FROM gold.fact_sales WHERE sales < 0 OR quantity <= 0 OR discount NOT BETWEEN 0 AND 1"
         )).scalar_one()
         totals_match = connection.execute(text("""
-            SELECT COUNT(*) = 0
+            SELECT ABS(COALESCE(s.sales, 0) - COALESCE(g.sales, 0)) <= 0.000001
+               AND ABS(COALESCE(s.profit, 0) - COALESCE(g.profit, 0)) <= 0.000001
+               AND COALESCE(s.quantity, 0) = COALESCE(g.quantity, 0)
             FROM (
                 SELECT SUM(sales) AS sales, SUM(profit) AS profit, SUM(quantity) AS quantity
                 FROM silver.superstore
-                EXCEPT
-                SELECT SUM(sales), SUM(profit), SUM(quantity)
+            ) s
+            CROSS JOIN (
+                SELECT SUM(sales) AS sales, SUM(profit) AS profit, SUM(quantity) AS quantity
                 FROM gold.fact_sales
-            ) differences
+            ) g
         """)).scalar_one()
         checks = {
         "silver/gold row count": silver_count == gold_count,
