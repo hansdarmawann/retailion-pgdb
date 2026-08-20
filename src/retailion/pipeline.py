@@ -28,7 +28,19 @@ def run_bronze(engine, source_path: Path) -> int:
     frame = pd.read_csv(source_path, encoding="latin-1")
     with engine.begin() as connection:
         connection.execute(text("CREATE SCHEMA IF NOT EXISTS bronze"))
-    frame.to_sql("superstore", engine, schema="bronze", if_exists="replace", index=False)
+        connection.execute(text("DROP TABLE IF EXISTS bronze.superstore_stage"))
+    frame.to_sql("superstore_stage", engine, schema="bronze", if_exists="replace", index=False)
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE IF NOT EXISTS bronze.superstore
+            (LIKE bronze.superstore_stage INCLUDING DEFAULTS);
+            TRUNCATE TABLE bronze.superstore;
+            INSERT INTO bronze.superstore
+            SELECT * FROM bronze.superstore_stage;
+            DROP TABLE bronze.superstore_stage;
+            COMMENT ON TABLE bronze.superstore IS
+                'Raw source snapshot loaded through a staging table.';
+        """))
     return len(frame)
 
 
