@@ -131,6 +131,17 @@ The command loads the CSV into Bronze, rebuilds Silver and Gold in a transaction
 creates keys/indexes, and stops if the data-quality checks fail. It uses the same
 local PostgreSQL settings from `.env`; Docker is not required.
 
+If the configured database does not exist yet, create it safely with:
+
+```bash
+python scripts/create_database.py
+python scripts/run_pipeline.py
+```
+
+The database script connects to PostgreSQL's `postgres` maintenance database,
+checks for the configured database, and creates it only when missing. It does
+not drop or overwrite an existing database.
+
 ### Verify PostgreSQL Setup
 
 Before running notebooks, verify PostgreSQL is ready:

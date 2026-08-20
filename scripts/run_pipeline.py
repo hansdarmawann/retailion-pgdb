@@ -1,4 +1,5 @@
 from pathlib import Path
+import argparse
 import logging
 import sys
 
@@ -9,6 +10,10 @@ from retailion.pipeline import run  # noqa: E402
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run the Retailion warehouse pipeline")
+    parser.add_argument("--source", type=Path, default=ROOT / "data" / "Sample - Superstore.csv")
+    parser.add_argument("--start-date", help="Optional inclusive order date filter (YYYY-MM-DD)")
+    parser.add_argument("--end-date", help="Optional inclusive order date filter (YYYY-MM-DD)")
+    args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    run(ROOT / "data" / "Sample - Superstore.csv")
-
+    run(args.source, start_date=args.start_date, end_date=args.end_date)
