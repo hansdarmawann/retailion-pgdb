@@ -89,7 +89,6 @@ def run_gold(engine) -> int:
     DROP TABLE IF EXISTS gold.dim_location;
     DROP TABLE IF EXISTS gold.dim_products;
     DROP TABLE IF EXISTS gold.dim_customers;
-    DROP TABLE IF EXISTS gold.dim_customers_scd2;
 
     CREATE TABLE gold.dim_customers AS
     SELECT ROW_NUMBER() OVER (ORDER BY customer_id)::INTEGER AS customer_key,
@@ -102,15 +101,46 @@ def run_gold(engine) -> int:
     ALTER TABLE gold.dim_customers ADD PRIMARY KEY (customer_key);
     ALTER TABLE gold.dim_customers ADD CONSTRAINT uq_dim_customers_business_key UNIQUE (customer_id);
 
-    CREATE TABLE gold.dim_customers_scd2 AS
-    SELECT customer_key, customer_id, customer_name, segment,
-           history.ingested_at AS valid_from,
-           CAST(NULL AS TIMESTAMPTZ) AS valid_to,
-           TRUE AS is_current
-    FROM gold.dim_customers c
-    JOIN (SELECT DISTINCT customer_id, FIRST_VALUE(ingested_at) OVER (PARTITION BY customer_id ORDER BY ingested_at) AS ingested_at
-          FROM silver.superstore) history USING (customer_id);
-    ALTER TABLE gold.dim_customers_scd2 ADD PRIMARY KEY (customer_key);
+    CREATE TABLE IF NOT EXISTS gold.dim_customers_scd2 (
+        customer_key BIGSERIAL PRIMARY KEY,
+        customer_id TEXT NOT NULL,
+        customer_name TEXT,
+        segment TEXT,
+        valid_from TIMESTAMPTZ NOT NULL,
+        valid_to TIMESTAMPTZ,
+        is_current BOOLEAN NOT NULL,
+        UNIQUE (customer_id, valid_from)
+    );
+    ALTER TABLE gold.dim_customers_scd2
+        ADD COLUMN IF NOT EXISTS customer_key BIGINT;
+    CREATE SEQUENCE IF NOT EXISTS gold.dim_customers_scd2_customer_key_seq;
+    ALTER TABLE gold.dim_customers_scd2
+        ALTER COLUMN customer_key SET DEFAULT
+            nextval('gold.dim_customers_scd2_customer_key_seq');
+    SELECT setval(
+        'gold.dim_customers_scd2_customer_key_seq',
+        COALESCE((SELECT MAX(customer_key) FROM gold.dim_customers_scd2), 0) + 1,
+        FALSE
+    );
+    UPDATE gold.dim_customers_scd2 history
+    SET valid_to = CURRENT_TIMESTAMP,
+        is_current = FALSE
+    FROM gold.dim_customers current_dim
+    WHERE history.customer_id = current_dim.customer_id
+      AND history.is_current
+      AND (history.customer_name, history.segment)
+          IS DISTINCT FROM (current_dim.customer_name, current_dim.segment);
+    INSERT INTO gold.dim_customers_scd2
+        (customer_id, customer_name, segment, valid_from, valid_to, is_current)
+    SELECT current_dim.customer_id, current_dim.customer_name, current_dim.segment,
+           current_dim.ingested_at, NULL, TRUE
+    FROM gold.dim_customers current_dim
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM gold.dim_customers_scd2 history
+        WHERE history.customer_id = current_dim.customer_id
+          AND history.valid_from = current_dim.ingested_at
+    );
 
     CREATE TABLE gold.dim_products AS
     SELECT ROW_NUMBER() OVER (ORDER BY product_id)::INTEGER AS product_key,
