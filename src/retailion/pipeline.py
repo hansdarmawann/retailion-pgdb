@@ -1,5 +1,6 @@
 from pathlib import Path
 import logging
+import os
 import secrets
 import time
 import uuid
@@ -12,6 +13,8 @@ from .config import Settings
 from .database import create_db_engine
 
 LOGGER = logging.getLogger(__name__)
+QUALITY_FAILURE_MODE = os.getenv("QUALITY_FAILURE_MODE", "STOP").upper()
+QUALITY_RULE_VERSION = os.getenv("QUALITY_RULE_VERSION", "1.0.0")
 
 
 def new_run_id() -> str:
@@ -299,18 +302,60 @@ def validate(engine, silver_count: int, gold_count: int, run_id: str) -> None:
     }
     with engine.begin() as connection:
         connection.execute(text("""
+            CREATE TABLE IF NOT EXISTS control.data_contract_rules (
+                rule_name TEXT PRIMARY KEY,
+                contract_name TEXT NOT NULL,
+                owner TEXT NOT NULL,
+                severity TEXT NOT NULL CHECK (severity IN ('STOP', 'WARN', 'QUARANTINE')),
+                rule_version TEXT NOT NULL,
+                description TEXT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        connection.execute(text("""
+            INSERT INTO control.data_contract_rules
+                (rule_name, contract_name, owner, severity, rule_version, description)
+            VALUES
+                ('silver/gold row count', 'superstore_sales',
+                 'data-engineering', 'STOP', :version,
+                 'Silver and Gold must contain the same number of rows'),
+                ('null location keys', 'superstore_sales',
+                 'data-engineering', 'STOP', :version,
+                 'Published fact rows must resolve to a location key'),
+                ('invalid measures', 'superstore_sales',
+                 'data-quality', 'QUARANTINE', :version,
+                 'Sales, quantity and discount must satisfy business constraints'),
+                ('silver/gold totals', 'superstore_sales',
+                 'finance-data-owner', 'STOP', :version,
+                 'Silver and Gold measures must reconcile within tolerance')
+            ON CONFLICT (rule_name) DO UPDATE SET
+                owner = EXCLUDED.owner,
+                severity = EXCLUDED.severity,
+                rule_version = EXCLUDED.rule_version,
+                description = EXCLUDED.description,
+                updated_at = CURRENT_TIMESTAMP
+        """), {"version": QUALITY_RULE_VERSION})
+        connection.execute(text("""
             CREATE TABLE IF NOT EXISTS control.data_quality_results (
                 run_id UUID, rule_name TEXT, passed BOOLEAN NOT NULL,
+                rule_version TEXT NOT NULL DEFAULT '1.0.0',
                 checked_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (run_id, rule_name)
             )
         """))
         connection.execute(text("""
-            INSERT INTO control.data_quality_results (run_id, rule_name, passed)
-            VALUES (:run_id, :rule_name, :passed)
+            ALTER TABLE control.data_quality_results
+                ADD COLUMN IF NOT EXISTS rule_version TEXT NOT NULL DEFAULT '1.0.0'
+        """))
+        connection.execute(text("""
+            INSERT INTO control.data_quality_results
+                (run_id, rule_name, passed, rule_version)
+            VALUES (:run_id, :rule_name, :passed, :version)
             ON CONFLICT (run_id, rule_name) DO UPDATE SET passed = EXCLUDED.passed,
+                rule_version = EXCLUDED.rule_version,
                 checked_at = CURRENT_TIMESTAMP
         """), [{"run_id": run_id, "rule_name": name, "passed": passed}
+               | {"version": QUALITY_RULE_VERSION}
                for name, passed in checks.items()])
         connection.execute(text("""
             CREATE TABLE IF NOT EXISTS control.reconciliation_results (
@@ -330,7 +375,16 @@ def validate(engine, silver_count: int, gold_count: int, run_id: str) -> None:
         """), {"run_id": run_id, "passed": checks["silver/gold totals"]})
     failed = [name for name, passed in checks.items() if not passed]
     if failed:
-        raise RuntimeError("Data quality checks failed: " + ", ".join(failed))
+        message = (
+            f"Data quality checks failed under {QUALITY_FAILURE_MODE} policy "
+            f"(version {QUALITY_RULE_VERSION}): " + ", ".join(failed)
+        )
+        if QUALITY_FAILURE_MODE == "WARN":
+            LOGGER.warning(message)
+        elif QUALITY_FAILURE_MODE == "QUARANTINE":
+            LOGGER.error(message + "; invalid rows were routed to quarantine")
+        else:
+            raise RuntimeError(message)
     LOGGER.info("All data quality checks passed")
 
 
