@@ -56,6 +56,8 @@ def run_silver(engine, run_id: str, source_file: str, start_date=None, end_date=
     WHERE "Order ID" IS NOT NULL
       AND (:start_date IS NULL OR TO_DATE("Order Date", 'MM/DD/YYYY') >= CAST(:start_date AS DATE))
       AND (:end_date IS NULL OR TO_DATE("Order Date", 'MM/DD/YYYY') <= CAST(:end_date AS DATE));
+    COMMENT ON TABLE silver.superstore IS
+        'Grain: one row per source transaction row_id.';
     """
     with engine.begin() as connection:
         connection.execute(text(sql), {"run_id": run_id, "source_file": source_file,
@@ -78,13 +80,26 @@ def run_silver(engine, run_id: str, source_file: str, start_date=None, end_date=
             FROM silver.superstore s
             WHERE quantity <= 0 OR discount NOT BETWEEN 0 AND 1 OR sales < 0
         """), {"run_id": run_id})
-        return connection.execute(text("SELECT COUNT(*) FROM silver.superstore")).scalar_one()
+        silver_count = connection.execute(text("SELECT COUNT(*) FROM silver.superstore")).scalar_one()
+        bronze_count = connection.execute(text("""
+            SELECT COUNT(*)
+            FROM bronze.superstore
+            WHERE "Order ID" IS NOT NULL
+              AND (:start_date IS NULL OR TO_DATE("Order Date", 'MM/DD/YYYY') >= CAST(:start_date AS DATE))
+              AND (:end_date IS NULL OR TO_DATE("Order Date", 'MM/DD/YYYY') <= CAST(:end_date AS DATE))
+        """), {"start_date": start_date, "end_date": end_date}).scalar_one()
+        if silver_count != bronze_count:
+            raise RuntimeError(
+                f"Bronze/Silver reconciliation failed: bronze={bronze_count}, silver={silver_count}"
+            )
+        return silver_count
 
 
 def run_gold(engine) -> int:
     sql = """
     CREATE SCHEMA IF NOT EXISTS gold;
     DROP TABLE IF EXISTS gold.fact_sales;
+    DROP TABLE IF EXISTS gold.sales_daily;
     DROP TABLE IF EXISTS gold.dim_date;
     DROP TABLE IF EXISTS gold.dim_location;
     DROP TABLE IF EXISTS gold.dim_products;
@@ -175,7 +190,7 @@ def run_gold(engine) -> int:
     FROM dates WHERE date_key IS NOT NULL;
     ALTER TABLE gold.dim_date ADD PRIMARY KEY (date_key);
 
-    CREATE TABLE gold.fact_sales AS
+    CREATE TABLE gold.fact_sales_stage AS
     SELECT s.row_id, s.order_id, s.order_date, s.ship_date,
            c.customer_key, p.product_key, l.location_id,
            s.ship_mode, s.sales, s.quantity, s.discount, s.profit,
@@ -184,7 +199,12 @@ def run_gold(engine) -> int:
     JOIN gold.dim_customers c ON s.customer_id = c.customer_id
     JOIN gold.dim_products p ON s.product_id = p.product_id
     LEFT JOIN gold.dim_location l USING (country, region, state, city, postal_code);
-    ALTER TABLE gold.fact_sales ADD PRIMARY KEY (row_id);
+    CREATE TABLE gold.fact_sales (LIKE gold.fact_sales_stage INCLUDING DEFAULTS)
+        PARTITION BY RANGE (order_date);
+    CREATE TABLE gold.fact_sales_default PARTITION OF gold.fact_sales DEFAULT;
+    INSERT INTO gold.fact_sales SELECT * FROM gold.fact_sales_stage;
+    DROP TABLE gold.fact_sales_stage;
+    ALTER TABLE gold.fact_sales ADD PRIMARY KEY (row_id, order_date);
     ALTER TABLE gold.fact_sales ADD CONSTRAINT fk_fact_customer FOREIGN KEY (customer_key) REFERENCES gold.dim_customers(customer_key);
     ALTER TABLE gold.fact_sales ADD CONSTRAINT fk_fact_product FOREIGN KEY (product_key) REFERENCES gold.dim_products(product_key);
     ALTER TABLE gold.fact_sales ADD CONSTRAINT fk_fact_location FOREIGN KEY (location_id) REFERENCES gold.dim_location(location_id);
@@ -194,9 +214,36 @@ def run_gold(engine) -> int:
     CREATE INDEX idx_fact_product ON gold.fact_sales(product_key);
     CREATE INDEX idx_fact_location ON gold.fact_sales(location_id);
     CREATE INDEX idx_fact_order_date ON gold.fact_sales(order_date);
+    COMMENT ON TABLE gold.fact_sales IS
+        'Grain: one row per source transaction row_id, partitioned by order_date.';
+    CREATE TABLE gold.sales_daily AS
+    SELECT order_date, customer_key, product_key, location_id,
+           SUM(sales) AS sales, SUM(quantity) AS quantity,
+           SUM(profit) AS profit, COUNT(*) AS transaction_count
+    FROM gold.fact_sales
+    GROUP BY order_date, customer_key, product_key, location_id;
+    COMMENT ON TABLE gold.sales_daily IS
+        'Semantic serving grain: one row per order_date, customer, product and location.';
     """
     with engine.begin() as connection:
         connection.execute(text(sql))
+        boundary_match = connection.execute(text("""
+            SELECT ABS(COALESCE(f.sales, 0) - COALESCE(d.sales, 0)) <= 0.000001
+               AND ABS(COALESCE(f.profit, 0) - COALESCE(d.profit, 0)) <= 0.000001
+               AND COALESCE(f.quantity, 0) = COALESCE(d.quantity, 0)
+               AND f.rows = d.rows
+            FROM (SELECT SUM(sales) sales, SUM(profit) profit,
+                         SUM(quantity) quantity, COUNT(*) rows
+                  FROM gold.fact_sales) f
+            CROSS JOIN
+                 (SELECT SUM(sales) sales, SUM(profit) profit,
+                         SUM(quantity) quantity, SUM(transaction_count) rows
+                  FROM gold.sales_daily) d
+        """)).scalar_one()
+        if not boundary_match:
+            raise RuntimeError(
+                "Fact/serving reconciliation failed"
+            )
         return connection.execute(text("SELECT COUNT(*) FROM gold.fact_sales")).scalar_one()
 
 
