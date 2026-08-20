@@ -1,7 +1,9 @@
 from pathlib import Path
 import logging
+import secrets
+import time
+import uuid
 from datetime import datetime, timezone
-from uuid import uuid4
 
 import pandas as pd
 from sqlalchemy import text
@@ -10,6 +12,15 @@ from .config import Settings
 from .database import create_db_engine
 
 LOGGER = logging.getLogger(__name__)
+
+
+def new_run_id() -> str:
+    """Return an RFC 9562 version-7 UUID without external dependencies."""
+    timestamp_ms = time.time_ns() // 1_000_000
+    random_bits = secrets.randbits(76)
+    value = (timestamp_ms << 80) | (0x7 << 76) | random_bits
+    value = (value & ~(0b11 << 62)) | (0b10 << 62)
+    return str(uuid.UUID(int=value))
 
 
 def run_bronze(engine, source_path: Path) -> int:
@@ -314,7 +325,7 @@ def validate(engine, silver_count: int, gold_count: int, run_id: str) -> None:
 def run(source_path: Path, start_date=None, end_date=None) -> None:
     settings = Settings.from_env()
     engine = create_db_engine(settings)
-    run_id = str(uuid4())
+    run_id = new_run_id()
     started_at = datetime.now(timezone.utc)
     try:
         with engine.begin() as connection:
