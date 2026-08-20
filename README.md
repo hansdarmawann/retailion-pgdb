@@ -118,6 +118,19 @@ Execute notebooks in order:
 
 **Important:** Ensure your `.env` file is configured with PostgreSQL credentials before running.
 
+### Running the Python Pipeline
+
+The notebooks remain useful for exploration, but the repeatable ETL flow is also
+available as a command-line pipeline. From the repository root, run:
+
+```bash
+python scripts/run_pipeline.py
+```
+
+The command loads the CSV into Bronze, rebuilds Silver and Gold in a transaction,
+creates keys/indexes, and stops if the data-quality checks fail. It uses the same
+local PostgreSQL settings from `.env`; Docker is not required.
+
 ### Verify PostgreSQL Setup
 
 Before running notebooks, verify PostgreSQL is ready:
