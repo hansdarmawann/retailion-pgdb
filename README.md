@@ -523,6 +523,81 @@ df.to_sql('superstore', engine, schema='silver', if_exists='replace')
 
 ---
 
+## Current CLI Pipeline Features
+
+The repeatable pipeline in `scripts/run_pipeline.py` supports the following ingestion modes:
+
+```cmd
+python scripts\run_pipeline.py --mode full
+python scripts\run_pipeline.py --mode append
+python scripts\run_pipeline.py --mode upsert
+python scripts\run_pipeline.py --mode snapshot
+```
+
+- `full` rebuilds the Bronze snapshot from the source file.
+- `append` loads new source rows while preserving the accumulated Bronze data.
+- `upsert` replaces rows using `Row ID` as the business key.
+- `snapshot` stores a historical copy in `bronze.superstore_snapshots`.
+
+### Incremental Processing
+
+Append and upsert modes use `control.pipeline_watermarks`. The pipeline reads the last successful watermark and applies an overlap window for late-arriving records:
+
+```cmd
+python scripts\run_pipeline.py --mode upsert --overlap-days 3
+```
+
+Replay and backfill are supported with an explicit date range:
+
+```cmd
+python scripts\run_pipeline.py --mode upsert --start-date 2017-01-01 --end-date 2017-03-31 --replay
+```
+
+The watermark advances only after successful validation and publish. If no rows are available after the watermark, the run is recorded as `NOOP` and existing Silver/Gold data is preserved.
+
+### Snapshot-Diff CDC and Source Controls
+
+Because the source is a CSV file rather than an OLTP transaction log, CDC is implemented as snapshot comparison. Each run can record `INSERT`, `UPDATE`, and `DELETE` events in `control.cdc_events`. Source deletions are also recorded in `control.source_deletions`.
+
+Source schema and extraction controls are recorded in:
+
+- `control.source_schema_registry`
+- `control.source_schema_changes`
+- `control.data_profile_results`
+
+The source file is fingerprinted before and after extraction. Chunked extraction and throttling are available for controlled batch ingestion:
+
+```cmd
+python scripts\run_pipeline.py --mode append --chunk-size 1000 --throttle-ms 100
+```
+
+### Gold Modeling and Serving
+
+The Gold layer includes:
+
+- SCD Type 1: `gold.dim_customers`
+- SCD Type 2: `gold.dim_customers_scd2`
+- Transaction fact: `gold.fact_sales`
+- Accumulating order snapshot: `gold.fact_order_fulfillment`
+- Daily serving table: `gold.sales_daily`
+- Monthly serving table: `gold.sales_monthly`
+- Date, product, customer, and location dimensions
+
+`gold.fact_sales` is partitioned by `order_date` with yearly partitions where source data exists, plus a default partition for unmatched dates.
+
+### Configuration and Exit Codes
+
+Runtime configuration is read from `.env`. The CLI returns exit code `0` on success and exit code `1` for configuration, source, pipeline, or data-quality failures:
+
+```cmd
+python scripts\run_pipeline.py --mode full
+echo %ERRORLEVEL%
+```
+
+Use `control.pipeline_runs`, `control.pipeline_watermarks`, `control.cdc_events`, and `control.data_quality_results` as the primary operational evidence tables.
+
+---
+
 ## 🎯 Key Learning Outcomes
 
 This project demonstrates:
