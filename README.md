@@ -1,4 +1,4 @@
-# Retailion: Superstore Data Warehouse
+# Retailion v2: Enterprise Data Warehouse Architecture
 
 A complete **data engineering project** demonstrating a modern data warehouse architecture using the **medallion pattern** (Bronze → Silver → Gold layers) with PostgreSQL, Python, and Jupyter notebooks.
 
