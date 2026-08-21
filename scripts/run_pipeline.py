@@ -22,7 +22,11 @@ if __name__ == "__main__":
         "--mode", choices=("full", "append", "upsert", "snapshot"), default="full",
         help="Bronze ingestion mode (default: full)",
     )
+    parser.add_argument(
+        "--overlap-days", type=int, default=2,
+        help="Days to look back from the watermark for late-arriving data",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     run(args.source, start_date=args.start_date, end_date=args.end_date,
-        replay=args.replay, load_mode=args.mode)
+        replay=args.replay, load_mode=args.mode, overlap_days=args.overlap_days)

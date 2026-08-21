@@ -1,4 +1,5 @@
 from pathlib import Path
+import hashlib
 import logging
 import os
 import secrets
@@ -86,6 +87,27 @@ def run_bronze(engine, source_path: Path, load_mode: str = "full", run_id: str |
     validate_source_schema(frame.columns)
     with engine.begin() as connection:
         connection.execute(text("CREATE SCHEMA IF NOT EXISTS bronze"))
+        connection.execute(text("CREATE SCHEMA IF NOT EXISTS control"))
+        connection.execute(text("""
+            CREATE TABLE IF NOT EXISTS control.source_schema_registry (
+                source_name TEXT PRIMARY KEY,
+                schema_hash TEXT NOT NULL,
+                columns TEXT NOT NULL,
+                observed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        schema_columns = ",".join(str(column) for column in frame.columns)
+        schema_hash = hashlib.sha256(schema_columns.encode("utf-8")).hexdigest()
+        connection.execute(text("""
+            INSERT INTO control.source_schema_registry
+                (source_name, schema_hash, columns)
+            VALUES (:source_name, :schema_hash, :columns)
+            ON CONFLICT (source_name) DO UPDATE SET
+                schema_hash = EXCLUDED.schema_hash,
+                columns = EXCLUDED.columns,
+                observed_at = CURRENT_TIMESTAMP
+        """), {"source_name": source_path.name, "schema_hash": schema_hash,
+                "columns": schema_columns})
     if load_mode == "snapshot":
         snapshot = frame.copy()
         snapshot["snapshot_run_id"] = run_id
@@ -100,9 +122,28 @@ def run_bronze(engine, source_path: Path, load_mode: str = "full", run_id: str |
             CREATE TABLE IF NOT EXISTS bronze.superstore
             (LIKE bronze.superstore_stage INCLUDING DEFAULTS);
         """))
+        if load_mode in {"full", "upsert", "snapshot"} and run_id is not None:
+            connection.execute(text("""
+                CREATE TABLE IF NOT EXISTS control.source_deletions (
+                    run_id UUID NOT NULL,
+                    row_id TEXT NOT NULL,
+                    detected_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (run_id, row_id)
+                )
+            """))
+            connection.execute(text("""
+                INSERT INTO control.source_deletions (run_id, row_id)
+                SELECT :run_id, CAST(existing."Row ID" AS TEXT)
+                FROM bronze.superstore existing
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM bronze.superstore_stage incoming
+                    WHERE incoming."Row ID" = existing."Row ID"
+                )
+                ON CONFLICT DO NOTHING
+            """), {"run_id": run_id})
         if load_mode == "full" or load_mode == "snapshot":
             connection.execute(text("TRUNCATE TABLE bronze.superstore"))
-        elif load_mode == "upsert":
+        elif load_mode in {"append", "upsert"}:
             connection.execute(text("""
                 DELETE FROM bronze.superstore target
                 USING bronze.superstore_stage stage
@@ -493,7 +534,7 @@ def validate(engine, silver_count: int, gold_count: int, run_id: str) -> None:
 
 
 def run(source_path: Path, start_date=None, end_date=None, replay=False,
-        load_mode: str = "full") -> None:
+        load_mode: str = "full", overlap_days: int = 2) -> None:
     settings = Settings.from_env()
     engine = create_db_engine(settings)
     run_id = new_run_id()
@@ -504,7 +545,7 @@ def run(source_path: Path, start_date=None, end_date=None, replay=False,
         if load_mode in {"append", "upsert"} and not replay and start_date is None:
             watermark = read_watermark(engine, pipeline_name)
             if watermark is not None:
-                start_date = watermark + timedelta(days=1)
+                start_date = watermark - timedelta(days=overlap_days)
                 LOGGER.info("Using watermark start date: %s", start_date)
         with engine.begin() as connection:
             connection.execute(text("CREATE SCHEMA IF NOT EXISTS control"))
@@ -545,7 +586,14 @@ def run(source_path: Path, start_date=None, end_date=None, replay=False,
                 run_id,
             )
             return
-        silver_count = run_silver(engine, run_id, source_path.name, start_date, end_date)
+        # Bronze is the accumulated source-of-record for append/upsert. Rebuild
+        # Silver from all retained Bronze rows so incremental ingestion does not
+        # discard historical facts.
+        silver_start_date = None if load_mode in {"append", "upsert"} else start_date
+        silver_end_date = None if load_mode in {"append", "upsert"} else end_date
+        silver_count = run_silver(
+            engine, run_id, source_path.name, silver_start_date, silver_end_date
+        )
         gold_count = run_gold(engine)
         validate(engine, silver_count, gold_count, run_id)
         with engine.connect() as connection:
