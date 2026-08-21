@@ -14,6 +14,10 @@ if __name__ == "__main__":
     parser.add_argument("--source", type=Path, default=ROOT / "data" / "Sample - Superstore.csv")
     parser.add_argument("--start-date", help="Optional inclusive order date filter (YYYY-MM-DD)")
     parser.add_argument("--end-date", help="Optional inclusive order date filter (YYYY-MM-DD)")
+    parser.add_argument(
+        "--replay", action="store_true",
+        help="Explicitly run a bounded replay/backfill window without advancing the watermark",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    run(args.source, start_date=args.start_date, end_date=args.end_date)
+    run(args.source, start_date=args.start_date, end_date=args.end_date, replay=args.replay)

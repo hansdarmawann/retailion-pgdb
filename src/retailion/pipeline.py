@@ -4,7 +4,7 @@ import os
 import secrets
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 from sqlalchemy import text
@@ -15,6 +15,58 @@ from .database import create_db_engine
 LOGGER = logging.getLogger(__name__)
 QUALITY_FAILURE_MODE = os.getenv("QUALITY_FAILURE_MODE", "STOP").upper()
 QUALITY_RULE_VERSION = os.getenv("QUALITY_RULE_VERSION", "1.0.0")
+REQUIRED_SOURCE_COLUMNS = {
+    "Row ID", "Order ID", "Order Date", "Ship Date", "Customer ID",
+    "Product ID", "Sales", "Quantity", "Discount", "Profit",
+}
+
+
+def validate_source_schema(columns) -> None:
+    """Fail fast when the source contract changes unexpectedly."""
+    missing = REQUIRED_SOURCE_COLUMNS.difference(columns)
+    if missing:
+        raise ValueError(
+            "Source schema validation failed; missing columns: "
+            + ", ".join(sorted(missing))
+        )
+
+
+def ensure_watermark_table(engine) -> None:
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE SCHEMA IF NOT EXISTS control;
+            CREATE TABLE IF NOT EXISTS control.pipeline_watermarks (
+                pipeline_name TEXT PRIMARY KEY,
+                watermark_date DATE,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+
+
+def read_watermark(engine, pipeline_name: str):
+    with engine.connect() as connection:
+        return connection.execute(text("""
+            SELECT watermark_date
+            FROM control.pipeline_watermarks
+            WHERE pipeline_name = :pipeline_name
+        """), {"pipeline_name": pipeline_name}).scalar_one_or_none()
+
+
+def advance_watermark(engine, pipeline_name: str, watermark_date) -> None:
+    if watermark_date is None:
+        return
+    with engine.begin() as connection:
+        connection.execute(text("""
+            INSERT INTO control.pipeline_watermarks
+                (pipeline_name, watermark_date)
+            VALUES (:pipeline_name, :watermark_date)
+            ON CONFLICT (pipeline_name) DO UPDATE SET
+                watermark_date = GREATEST(
+                    control.pipeline_watermarks.watermark_date,
+                    EXCLUDED.watermark_date
+                ),
+                updated_at = CURRENT_TIMESTAMP
+        """), {"pipeline_name": pipeline_name, "watermark_date": watermark_date})
 
 
 def new_run_id() -> str:
@@ -29,6 +81,7 @@ def new_run_id() -> str:
 def run_bronze(engine, source_path: Path) -> int:
     LOGGER.info("Loading %s into bronze.superstore", source_path)
     frame = pd.read_csv(source_path, encoding="latin-1")
+    validate_source_schema(frame.columns)
     with engine.begin() as connection:
         connection.execute(text("CREATE SCHEMA IF NOT EXISTS bronze"))
         connection.execute(text("DROP TABLE IF EXISTS bronze.superstore_stage"))
@@ -119,6 +172,37 @@ def run_silver(engine, run_id: str, source_file: str, start_date=None, end_date=
                 f"Bronze/Silver reconciliation failed: bronze={bronze_count}, silver={silver_count}"
             )
         return silver_count
+
+
+def count_source_rows(engine, start_date=None, end_date=None) -> int:
+    """Count source rows in the requested window before replacing Silver."""
+    with engine.connect() as connection:
+        return connection.execute(text("""
+            SELECT COUNT(*)
+            FROM bronze.superstore
+            WHERE "Order ID" IS NOT NULL
+              AND (:start_date IS NULL OR TO_DATE("Order Date", 'MM/DD/YYYY') >= CAST(:start_date AS DATE))
+              AND (:end_date IS NULL OR TO_DATE("Order Date", 'MM/DD/YYYY') <= CAST(:end_date AS DATE))
+        """), {"start_date": start_date, "end_date": end_date}).scalar_one()
+
+
+def mark_pipeline_run(engine, run_id: str, status: str, bronze_rows: int,
+                       silver_rows: int, gold_rows: int) -> None:
+    with engine.begin() as connection:
+        connection.execute(text("""
+            UPDATE control.pipeline_runs
+            SET finished_at = :finished_at, status = :status,
+                bronze_rows = :bronze_rows, silver_rows = :silver_rows,
+                gold_rows = :gold_rows
+            WHERE run_id = :run_id
+        """), {
+            "finished_at": datetime.now(timezone.utc),
+            "status": status,
+            "bronze_rows": bronze_rows,
+            "silver_rows": silver_rows,
+            "gold_rows": gold_rows,
+            "run_id": run_id,
+        })
 
 
 def run_gold(engine) -> int:
@@ -388,12 +472,19 @@ def validate(engine, silver_count: int, gold_count: int, run_id: str) -> None:
     LOGGER.info("All data quality checks passed")
 
 
-def run(source_path: Path, start_date=None, end_date=None) -> None:
+def run(source_path: Path, start_date=None, end_date=None, replay=False) -> None:
     settings = Settings.from_env()
     engine = create_db_engine(settings)
     run_id = new_run_id()
     started_at = datetime.now(timezone.utc)
+    pipeline_name = "retailion_superstore"
     try:
+        ensure_watermark_table(engine)
+        if not replay and start_date is None:
+            watermark = read_watermark(engine, pipeline_name)
+            if watermark is not None:
+                start_date = watermark + timedelta(days=1)
+                LOGGER.info("Using watermark start date: %s", start_date)
         with engine.begin() as connection:
             connection.execute(text("CREATE SCHEMA IF NOT EXISTS control"))
             connection.execute(text("""
@@ -411,13 +502,48 @@ def run(source_path: Path, start_date=None, end_date=None) -> None:
             """))
             connection.execute(text("""
                 INSERT INTO control.pipeline_runs (run_id, pipeline_name, started_at, status)
-                VALUES (:run_id, 'retailion_superstore', :started_at, 'STARTED')
-            """), {"run_id": run_id, "started_at": started_at})
+                VALUES (:run_id, :pipeline_name, :started_at, 'STARTED')
+            """), {"run_id": run_id, "pipeline_name": pipeline_name, "started_at": started_at})
+        # A replay/backfill is explicit: it bypasses any future watermark state
+        # and is still bounded by the optional date window.
         bronze_count = run_bronze(engine, source_path)
+        source_window_count = count_source_rows(engine, start_date, end_date)
+        if source_window_count == 0 and not replay:
+            with engine.connect() as connection:
+                gold_exists = connection.execute(text(
+                    "SELECT to_regclass('gold.fact_sales') IS NOT NULL"
+                )).scalar_one()
+                existing_gold_count = connection.execute(text(
+                    "SELECT COUNT(*) FROM gold.fact_sales"
+                )).scalar_one() if gold_exists else 0
+            mark_pipeline_run(
+                engine, run_id, "NOOP", bronze_count, 0, existing_gold_count or 0
+            )
+            LOGGER.info(
+                "No source rows after watermark; pipeline completed as NOOP run_id=%s",
+                run_id,
+            )
+            return
         silver_count = run_silver(engine, run_id, source_path.name, start_date, end_date)
         gold_count = run_gold(engine)
         validate(engine, silver_count, gold_count, run_id)
+        with engine.connect() as connection:
+            max_date = connection.execute(text(
+                "SELECT MAX(order_date) FROM silver.superstore"
+            )).scalar_one()
         with engine.begin() as connection:
+            if not replay and max_date is not None:
+                connection.execute(text("""
+                    INSERT INTO control.pipeline_watermarks
+                        (pipeline_name, watermark_date)
+                    VALUES (:pipeline_name, :watermark_date)
+                    ON CONFLICT (pipeline_name) DO UPDATE SET
+                        watermark_date = GREATEST(
+                            control.pipeline_watermarks.watermark_date,
+                            EXCLUDED.watermark_date
+                        ),
+                        updated_at = CURRENT_TIMESTAMP
+                """), {"pipeline_name": pipeline_name, "watermark_date": max_date})
             connection.execute(text("""
                 UPDATE control.pipeline_runs
                 SET finished_at = :finished_at, status = 'SUCCESS',
