@@ -10,10 +10,18 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 from sqlalchemy import text
 
-from .config import Settings
+from .config import ConfigurationError, Settings
 from .database import create_db_engine
 
 LOGGER = logging.getLogger(__name__)
+
+
+class PipelineError(RuntimeError):
+    """Base class for expected pipeline failures."""
+
+
+class DataQualityError(PipelineError):
+    """Raised when stop-mode data quality checks fail."""
 QUALITY_FAILURE_MODE = os.getenv("QUALITY_FAILURE_MODE", "STOP").upper()
 QUALITY_RULE_VERSION = os.getenv("QUALITY_RULE_VERSION", "1.0.0")
 REQUIRED_SOURCE_COLUMNS = {
@@ -406,6 +414,7 @@ def run_gold(engine) -> int:
     CREATE SCHEMA IF NOT EXISTS gold;
     DROP TABLE IF EXISTS gold.fact_sales CASCADE;
     DROP TABLE IF EXISTS gold.sales_daily;
+    DROP TABLE IF EXISTS gold.sales_monthly;
     DROP TABLE IF EXISTS gold.fact_order_fulfillment;
     DROP TABLE IF EXISTS gold.dim_date;
     DROP TABLE IF EXISTS gold.dim_location;
@@ -715,7 +724,7 @@ def validate(engine, silver_count: int, gold_count: int, run_id: str) -> None:
         elif QUALITY_FAILURE_MODE == "QUARANTINE":
             LOGGER.error(message + "; invalid rows were routed to quarantine")
         else:
-            raise RuntimeError(message)
+            raise DataQualityError(message)
     LOGGER.info("All data quality checks passed")
 
 
