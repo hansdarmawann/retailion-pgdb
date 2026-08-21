@@ -78,10 +78,19 @@ def new_run_id() -> str:
     return str(uuid.UUID(int=value))
 
 
-def run_bronze(engine, source_path: Path) -> int:
+def run_bronze(engine, source_path: Path, load_mode: str = "full", run_id: str | None = None) -> int:
+    if load_mode not in {"full", "append", "upsert", "snapshot"}:
+        raise ValueError(f"Unsupported load mode: {load_mode}")
     LOGGER.info("Loading %s into bronze.superstore", source_path)
     frame = pd.read_csv(source_path, encoding="latin-1")
     validate_source_schema(frame.columns)
+    with engine.begin() as connection:
+        connection.execute(text("CREATE SCHEMA IF NOT EXISTS bronze"))
+    if load_mode == "snapshot":
+        snapshot = frame.copy()
+        snapshot["snapshot_run_id"] = run_id
+        snapshot["snapshot_at"] = datetime.now(timezone.utc)
+        snapshot.to_sql("superstore_snapshots", engine, schema="bronze", if_exists="append", index=False)
     with engine.begin() as connection:
         connection.execute(text("CREATE SCHEMA IF NOT EXISTS bronze"))
         connection.execute(text("DROP TABLE IF EXISTS bronze.superstore_stage"))
@@ -90,9 +99,20 @@ def run_bronze(engine, source_path: Path) -> int:
         connection.execute(text("""
             CREATE TABLE IF NOT EXISTS bronze.superstore
             (LIKE bronze.superstore_stage INCLUDING DEFAULTS);
-            TRUNCATE TABLE bronze.superstore;
+        """))
+        if load_mode == "full" or load_mode == "snapshot":
+            connection.execute(text("TRUNCATE TABLE bronze.superstore"))
+        elif load_mode == "upsert":
+            connection.execute(text("""
+                DELETE FROM bronze.superstore target
+                USING bronze.superstore_stage stage
+                WHERE target."Row ID" = stage."Row ID"
+            """))
+        connection.execute(text("""
             INSERT INTO bronze.superstore
-            SELECT * FROM bronze.superstore_stage;
+            SELECT DISTINCT ON ("Row ID") *
+            FROM bronze.superstore_stage
+            ORDER BY "Row ID";
             DROP TABLE bronze.superstore_stage;
             COMMENT ON TABLE bronze.superstore IS
                 'Raw source snapshot loaded through a staging table.';
@@ -472,7 +492,8 @@ def validate(engine, silver_count: int, gold_count: int, run_id: str) -> None:
     LOGGER.info("All data quality checks passed")
 
 
-def run(source_path: Path, start_date=None, end_date=None, replay=False) -> None:
+def run(source_path: Path, start_date=None, end_date=None, replay=False,
+        load_mode: str = "full") -> None:
     settings = Settings.from_env()
     engine = create_db_engine(settings)
     run_id = new_run_id()
@@ -480,7 +501,7 @@ def run(source_path: Path, start_date=None, end_date=None, replay=False) -> None
     pipeline_name = "retailion_superstore"
     try:
         ensure_watermark_table(engine)
-        if not replay and start_date is None:
+        if load_mode in {"append", "upsert"} and not replay and start_date is None:
             watermark = read_watermark(engine, pipeline_name)
             if watermark is not None:
                 start_date = watermark + timedelta(days=1)
@@ -506,9 +527,9 @@ def run(source_path: Path, start_date=None, end_date=None, replay=False) -> None
             """), {"run_id": run_id, "pipeline_name": pipeline_name, "started_at": started_at})
         # A replay/backfill is explicit: it bypasses any future watermark state
         # and is still bounded by the optional date window.
-        bronze_count = run_bronze(engine, source_path)
+        bronze_count = run_bronze(engine, source_path, load_mode, run_id)
         source_window_count = count_source_rows(engine, start_date, end_date)
-        if source_window_count == 0 and not replay:
+        if source_window_count == 0 and load_mode in {"append", "upsert"} and not replay:
             with engine.connect() as connection:
                 gold_exists = connection.execute(text(
                     "SELECT to_regclass('gold.fact_sales') IS NOT NULL"

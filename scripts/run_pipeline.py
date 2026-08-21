@@ -18,6 +18,11 @@ if __name__ == "__main__":
         "--replay", action="store_true",
         help="Explicitly run a bounded replay/backfill window without advancing the watermark",
     )
+    parser.add_argument(
+        "--mode", choices=("full", "append", "upsert", "snapshot"), default="full",
+        help="Bronze ingestion mode (default: full)",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    run(args.source, start_date=args.start_date, end_date=args.end_date, replay=args.replay)
+    run(args.source, start_date=args.start_date, end_date=args.end_date,
+        replay=args.replay, load_mode=args.mode)
