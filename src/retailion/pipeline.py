@@ -246,11 +246,46 @@ def run_bronze(engine, source_path: Path, load_mode: str = "full", run_id: str |
 
 
 def run_silver(engine, run_id: str, source_file: str, start_date=None, end_date=None) -> int:
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE SCHEMA IF NOT EXISTS control;
+            CREATE TABLE IF NOT EXISTS control.data_profile_results (
+                run_id UUID NOT NULL,
+                metric_name TEXT NOT NULL,
+                metric_value NUMERIC NOT NULL,
+                profiled_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (run_id, metric_name)
+            )
+        """))
+        profile_rows = connection.execute(text("""
+            SELECT COUNT(*) AS total_rows,
+                   COUNT(*) FILTER (WHERE "Order ID" IS NULL) AS null_order_ids,
+                   COUNT(*) - COUNT(DISTINCT "Row ID") AS duplicate_row_ids
+            FROM bronze.superstore
+        """)).mappings().one()
+        connection.execute(text("""
+            INSERT INTO control.data_profile_results
+                (run_id, metric_name, metric_value)
+            VALUES (:run_id, :total_rows, :total_value),
+                   (:run_id, :null_order_ids, :null_value),
+                   (:run_id, :duplicate_row_ids, :duplicate_value)
+            ON CONFLICT (run_id, metric_name) DO UPDATE SET
+                metric_value = EXCLUDED.metric_value,
+                profiled_at = CURRENT_TIMESTAMP
+        """), {
+            "run_id": run_id,
+            "total_rows": "total_rows",
+            "total_value": profile_rows["total_rows"],
+            "null_order_ids": "null_order_ids",
+            "null_value": profile_rows["null_order_ids"],
+            "duplicate_row_ids": "duplicate_row_ids",
+            "duplicate_value": profile_rows["duplicate_row_ids"],
+        })
     sql = """
     CREATE SCHEMA IF NOT EXISTS silver;
     DROP TABLE IF EXISTS silver.superstore;
     CREATE TABLE silver.superstore AS
-    SELECT
+    SELECT DISTINCT ON ("Row ID")
         CAST("Row ID" AS INTEGER) AS row_id,
         "Order ID" AS order_id,
         TO_DATE("Order Date", 'MM/DD/YYYY') AS order_date,
@@ -284,7 +319,8 @@ def run_silver(engine, run_id: str, source_file: str, start_date=None, end_date=
             AND deleted.row_id = CAST("Row ID" AS TEXT)
       )
       AND (:start_date IS NULL OR TO_DATE("Order Date", 'MM/DD/YYYY') >= CAST(:start_date AS DATE))
-      AND (:end_date IS NULL OR TO_DATE("Order Date", 'MM/DD/YYYY') <= CAST(:end_date AS DATE));
+      AND (:end_date IS NULL OR TO_DATE("Order Date", 'MM/DD/YYYY') <= CAST(:end_date AS DATE))
+    ORDER BY "Row ID";
     COMMENT ON TABLE silver.superstore IS
         'Grain: one row per source transaction row_id.';
     """
