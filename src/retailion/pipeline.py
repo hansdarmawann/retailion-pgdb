@@ -79,11 +79,24 @@ def new_run_id() -> str:
     return str(uuid.UUID(int=value))
 
 
-def run_bronze(engine, source_path: Path, load_mode: str = "full", run_id: str | None = None) -> int:
+def run_bronze(engine, source_path: Path, load_mode: str = "full", run_id: str | None = None,
+               chunk_size: int | None = None, throttle_ms: int = 0) -> int:
     if load_mode not in {"full", "append", "upsert", "snapshot"}:
         raise ValueError(f"Unsupported load mode: {load_mode}")
     LOGGER.info("Loading %s into bronze.superstore", source_path)
-    frame = pd.read_csv(source_path, encoding="latin-1")
+    fingerprint_before = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    if chunk_size and chunk_size > 0:
+        chunks = []
+        for chunk in pd.read_csv(source_path, encoding="latin-1", chunksize=chunk_size):
+            chunks.append(chunk)
+            if throttle_ms > 0:
+                time.sleep(throttle_ms / 1000)
+        frame = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
+    else:
+        frame = pd.read_csv(source_path, encoding="latin-1")
+    fingerprint_after = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    if fingerprint_before != fingerprint_after:
+        raise RuntimeError("Source changed during extraction; load aborted for consistency")
     validate_source_schema(frame.columns)
     with engine.begin() as connection:
         connection.execute(text("CREATE SCHEMA IF NOT EXISTS bronze"))
@@ -93,15 +106,45 @@ def run_bronze(engine, source_path: Path, load_mode: str = "full", run_id: str |
                 source_name TEXT PRIMARY KEY,
                 schema_hash TEXT NOT NULL,
                 columns TEXT NOT NULL,
+                schema_version INTEGER NOT NULL DEFAULT 1,
                 observed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """))
+        connection.execute(text("""
+            CREATE TABLE IF NOT EXISTS control.source_schema_changes (
+                source_name TEXT NOT NULL,
+                run_id UUID NOT NULL,
+                previous_hash TEXT,
+                new_hash TEXT NOT NULL,
+                detected_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (source_name, run_id)
+            )
+        """))
+        connection.execute(text("""
+            ALTER TABLE control.source_schema_registry
+            ADD COLUMN IF NOT EXISTS schema_version INTEGER NOT NULL DEFAULT 1
+        """))
         schema_columns = ",".join(str(column) for column in frame.columns)
         schema_hash = hashlib.sha256(schema_columns.encode("utf-8")).hexdigest()
+        previous_hash = connection.execute(text("""
+            SELECT schema_hash FROM control.source_schema_registry
+            WHERE source_name = :source_name
+        """), {"source_name": source_path.name}).scalar_one_or_none()
+        if previous_hash and previous_hash != schema_hash:
+            connection.execute(text("""
+                INSERT INTO control.source_schema_changes
+                    (source_name, run_id, previous_hash, new_hash)
+                VALUES (:source_name, :run_id, :previous_hash, :new_hash)
+                ON CONFLICT DO NOTHING
+            """), {"source_name": source_path.name, "run_id": run_id,
+                    "previous_hash": previous_hash, "new_hash": schema_hash})
         connection.execute(text("""
             INSERT INTO control.source_schema_registry
-                (source_name, schema_hash, columns)
-            VALUES (:source_name, :schema_hash, :columns)
+                (source_name, schema_hash, columns, schema_version)
+            VALUES (:source_name, :schema_hash, :columns,
+                    COALESCE((SELECT schema_version + 1
+                              FROM control.source_schema_registry
+                              WHERE source_name = :source_name), 1))
             ON CONFLICT (source_name) DO UPDATE SET
                 schema_hash = EXCLUDED.schema_hash,
                 columns = EXCLUDED.columns,
@@ -122,15 +165,56 @@ def run_bronze(engine, source_path: Path, load_mode: str = "full", run_id: str |
             CREATE TABLE IF NOT EXISTS bronze.superstore
             (LIKE bronze.superstore_stage INCLUDING DEFAULTS);
         """))
-        if load_mode in {"full", "upsert", "snapshot"} and run_id is not None:
+        connection.execute(text("""
+            CREATE SCHEMA IF NOT EXISTS control;
+            CREATE TABLE IF NOT EXISTS control.source_deletions (
+                run_id UUID NOT NULL,
+                row_id TEXT NOT NULL,
+                detected_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (run_id, row_id)
+            )
+        """))
+        connection.execute(text("""
+            CREATE TABLE IF NOT EXISTS control.cdc_events (
+                run_id UUID NOT NULL,
+                row_id TEXT NOT NULL,
+                operation TEXT NOT NULL CHECK (operation IN ('INSERT', 'UPDATE', 'DELETE')),
+                detected_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (run_id, row_id, operation)
+            )
+        """))
+        if run_id is not None:
+            params = {"run_id": run_id}
             connection.execute(text("""
-                CREATE TABLE IF NOT EXISTS control.source_deletions (
-                    run_id UUID NOT NULL,
-                    row_id TEXT NOT NULL,
-                    detected_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (run_id, row_id)
+                INSERT INTO control.cdc_events (run_id, row_id, operation)
+                SELECT :run_id, CAST(incoming."Row ID" AS TEXT), 'INSERT'
+                FROM bronze.superstore_stage incoming
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM bronze.superstore existing
+                    WHERE existing."Row ID" = incoming."Row ID"
                 )
-            """))
+                ON CONFLICT DO NOTHING
+            """), params)
+            connection.execute(text("""
+                INSERT INTO control.cdc_events (run_id, row_id, operation)
+                SELECT :run_id, CAST(incoming."Row ID" AS TEXT), 'UPDATE'
+                FROM bronze.superstore_stage incoming
+                JOIN bronze.superstore existing
+                  ON existing."Row ID" = incoming."Row ID"
+                WHERE md5(row_to_json(existing)::text) <> md5(row_to_json(incoming)::text)
+                ON CONFLICT DO NOTHING
+            """), params)
+            connection.execute(text("""
+                INSERT INTO control.cdc_events (run_id, row_id, operation)
+                SELECT :run_id, CAST(existing."Row ID" AS TEXT), 'DELETE'
+                FROM bronze.superstore existing
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM bronze.superstore_stage incoming
+                    WHERE incoming."Row ID" = existing."Row ID"
+                )
+                ON CONFLICT DO NOTHING
+            """), params)
+        if load_mode in {"full", "upsert", "snapshot"} and run_id is not None:
             connection.execute(text("""
                 INSERT INTO control.source_deletions (run_id, row_id)
                 SELECT :run_id, CAST(existing."Row ID" AS TEXT)
@@ -194,6 +278,11 @@ def run_silver(engine, run_id: str, source_file: str, start_date=None, end_date=
         '1.0.0' AS pipeline_version
     FROM bronze.superstore
     WHERE "Order ID" IS NOT NULL
+      AND NOT EXISTS (
+          SELECT 1 FROM control.source_deletions deleted
+          WHERE deleted.run_id = :run_id
+            AND deleted.row_id = CAST("Row ID" AS TEXT)
+      )
       AND (:start_date IS NULL OR TO_DATE("Order Date", 'MM/DD/YYYY') >= CAST(:start_date AS DATE))
       AND (:end_date IS NULL OR TO_DATE("Order Date", 'MM/DD/YYYY') <= CAST(:end_date AS DATE));
     COMMENT ON TABLE silver.superstore IS
@@ -225,9 +314,14 @@ def run_silver(engine, run_id: str, source_file: str, start_date=None, end_date=
             SELECT COUNT(*)
             FROM bronze.superstore
             WHERE "Order ID" IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM control.source_deletions deleted
+                  WHERE deleted.run_id = :run_id
+                    AND deleted.row_id = CAST("Row ID" AS TEXT)
+              )
               AND (:start_date IS NULL OR TO_DATE("Order Date", 'MM/DD/YYYY') >= CAST(:start_date AS DATE))
               AND (:end_date IS NULL OR TO_DATE("Order Date", 'MM/DD/YYYY') <= CAST(:end_date AS DATE))
-        """), {"start_date": start_date, "end_date": end_date}).scalar_one()
+        """), {"run_id": run_id, "start_date": start_date, "end_date": end_date}).scalar_one()
         if silver_count != bronze_count:
             raise RuntimeError(
                 f"Bronze/Silver reconciliation failed: bronze={bronze_count}, silver={silver_count}"
@@ -235,16 +329,21 @@ def run_silver(engine, run_id: str, source_file: str, start_date=None, end_date=
         return silver_count
 
 
-def count_source_rows(engine, start_date=None, end_date=None) -> int:
+def count_source_rows(engine, run_id: str, start_date=None, end_date=None) -> int:
     """Count source rows in the requested window before replacing Silver."""
     with engine.connect() as connection:
         return connection.execute(text("""
             SELECT COUNT(*)
             FROM bronze.superstore
             WHERE "Order ID" IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM control.source_deletions deleted
+                  WHERE deleted.run_id = :run_id
+                    AND deleted.row_id = CAST("Row ID" AS TEXT)
+              )
               AND (:start_date IS NULL OR TO_DATE("Order Date", 'MM/DD/YYYY') >= CAST(:start_date AS DATE))
               AND (:end_date IS NULL OR TO_DATE("Order Date", 'MM/DD/YYYY') <= CAST(:end_date AS DATE))
-        """), {"start_date": start_date, "end_date": end_date}).scalar_one()
+        """), {"run_id": run_id, "start_date": start_date, "end_date": end_date}).scalar_one()
 
 
 def mark_pipeline_run(engine, run_id: str, status: str, bronze_rows: int,
@@ -534,7 +633,8 @@ def validate(engine, silver_count: int, gold_count: int, run_id: str) -> None:
 
 
 def run(source_path: Path, start_date=None, end_date=None, replay=False,
-        load_mode: str = "full", overlap_days: int = 2) -> None:
+        load_mode: str = "full", overlap_days: int = 2,
+        chunk_size: int | None = None, throttle_ms: int = 0) -> None:
     settings = Settings.from_env()
     engine = create_db_engine(settings)
     run_id = new_run_id()
@@ -568,8 +668,10 @@ def run(source_path: Path, start_date=None, end_date=None, replay=False,
             """), {"run_id": run_id, "pipeline_name": pipeline_name, "started_at": started_at})
         # A replay/backfill is explicit: it bypasses any future watermark state
         # and is still bounded by the optional date window.
-        bronze_count = run_bronze(engine, source_path, load_mode, run_id)
-        source_window_count = count_source_rows(engine, start_date, end_date)
+        bronze_count = run_bronze(
+            engine, source_path, load_mode, run_id, chunk_size, throttle_ms
+        )
+        source_window_count = count_source_rows(engine, run_id, start_date, end_date)
         if source_window_count == 0 and load_mode in {"append", "upsert"} and not replay:
             with engine.connect() as connection:
                 gold_exists = connection.execute(text(
