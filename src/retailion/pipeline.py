@@ -404,8 +404,9 @@ def mark_pipeline_run(engine, run_id: str, status: str, bronze_rows: int,
 def run_gold(engine) -> int:
     sql = """
     CREATE SCHEMA IF NOT EXISTS gold;
-    DROP TABLE IF EXISTS gold.fact_sales;
+    DROP TABLE IF EXISTS gold.fact_sales CASCADE;
     DROP TABLE IF EXISTS gold.sales_daily;
+    DROP TABLE IF EXISTS gold.fact_order_fulfillment;
     DROP TABLE IF EXISTS gold.dim_date;
     DROP TABLE IF EXISTS gold.dim_location;
     DROP TABLE IF EXISTS gold.dim_products;
@@ -498,20 +499,46 @@ def run_gold(engine) -> int:
 
     CREATE TABLE gold.fact_sales_stage AS
     SELECT s.row_id, s.order_id, s.order_date, s.ship_date,
-           c.customer_key, p.product_key, l.location_id,
+           c.customer_key, scd.customer_key AS scd2_customer_key,
+           p.product_key, l.location_id,
            s.ship_mode, s.sales, s.quantity, s.discount, s.profit,
            s.run_id, s.ingested_at
     FROM silver.superstore s
     JOIN gold.dim_customers c ON s.customer_id = c.customer_id
+    LEFT JOIN LATERAL (
+        SELECT customer_key
+        FROM gold.dim_customers_scd2 history
+        WHERE history.customer_id = s.customer_id
+          AND history.is_current
+        ORDER BY history.valid_from DESC, history.customer_key DESC
+        LIMIT 1
+    ) scd ON TRUE
     JOIN gold.dim_products p ON s.product_id = p.product_id
     LEFT JOIN gold.dim_location l USING (country, region, state, city, postal_code);
     CREATE TABLE gold.fact_sales (LIKE gold.fact_sales_stage INCLUDING DEFAULTS)
         PARTITION BY RANGE (order_date);
+    DO $$
+    DECLARE year_value INTEGER;
+    BEGIN
+        FOR year_value IN
+            SELECT DISTINCT EXTRACT(YEAR FROM order_date)::INTEGER
+            FROM silver.superstore
+            WHERE order_date IS NOT NULL
+        LOOP
+            EXECUTE format(
+                'CREATE TABLE IF NOT EXISTS gold.fact_sales_y%s PARTITION OF gold.fact_sales FOR VALUES FROM (%L) TO (%L)',
+                year_value,
+                make_date(year_value, 1, 1),
+                make_date(year_value + 1, 1, 1)
+            );
+        END LOOP;
+    END $$;
     CREATE TABLE gold.fact_sales_default PARTITION OF gold.fact_sales DEFAULT;
     INSERT INTO gold.fact_sales SELECT * FROM gold.fact_sales_stage;
     DROP TABLE gold.fact_sales_stage;
     ALTER TABLE gold.fact_sales ADD PRIMARY KEY (row_id, order_date);
     ALTER TABLE gold.fact_sales ADD CONSTRAINT fk_fact_customer FOREIGN KEY (customer_key) REFERENCES gold.dim_customers(customer_key);
+    ALTER TABLE gold.fact_sales ADD CONSTRAINT fk_fact_customer_scd2 FOREIGN KEY (scd2_customer_key) REFERENCES gold.dim_customers_scd2(customer_key);
     ALTER TABLE gold.fact_sales ADD CONSTRAINT fk_fact_product FOREIGN KEY (product_key) REFERENCES gold.dim_products(product_key);
     ALTER TABLE gold.fact_sales ADD CONSTRAINT fk_fact_location FOREIGN KEY (location_id) REFERENCES gold.dim_location(location_id);
     ALTER TABLE gold.fact_sales ADD CONSTRAINT fk_fact_order_date FOREIGN KEY (order_date) REFERENCES gold.dim_date(date_key);
@@ -530,6 +557,30 @@ def run_gold(engine) -> int:
     GROUP BY order_date, customer_key, product_key, location_id;
     COMMENT ON TABLE gold.sales_daily IS
         'Semantic serving grain: one row per order_date, customer, product and location.';
+    CREATE TABLE gold.fact_order_fulfillment AS
+    SELECT order_id,
+           MIN(order_date) AS order_date,
+           MAX(ship_date) AS ship_date,
+           MAX(ship_date) - MIN(order_date) AS days_to_ship,
+           COUNT(*) AS line_count,
+           SUM(sales) AS sales,
+           SUM(quantity) AS quantity,
+           SUM(profit) AS profit
+    FROM silver.superstore
+    GROUP BY order_id;
+    ALTER TABLE gold.fact_order_fulfillment ADD PRIMARY KEY (order_id);
+    COMMENT ON TABLE gold.fact_order_fulfillment IS
+        'Accumulating snapshot grain: one row per order lifecycle.';
+    CREATE TABLE gold.sales_monthly AS
+    SELECT DATE_TRUNC('month', order_date)::DATE AS month_key,
+           customer_key, product_key, location_id,
+           SUM(sales) AS sales, SUM(quantity) AS quantity,
+           SUM(profit) AS profit, SUM(transaction_count) AS transaction_count
+    FROM gold.sales_daily
+    GROUP BY DATE_TRUNC('month', order_date)::DATE,
+             customer_key, product_key, location_id;
+    COMMENT ON TABLE gold.sales_monthly IS
+        'Semantic serving grain: one row per month, customer, product and location.';
     """
     with engine.begin() as connection:
         connection.execute(text(sql))
