@@ -525,6 +525,84 @@ df.to_sql('superstore', engine, schema='silver', if_exists='replace')
 
 ## Current CLI Pipeline Features
 
+## DE-01 Enterprise Data Architecture Learning Notes
+
+### End-to-End Data Flow
+
+The repository demonstrates the following analytical data flow:
+
+```text
+Source CSV / OLTP system
+        |
+        v
+Ingestion and staging
+        |
+        v
+Bronze: raw landing data
+        |
+        v
+Silver: conformed and validated data
+        |
+        v
+Gold: dimensional and semantic serving data
+        |
+        v
+BI, reporting, and analytical consumers
+```
+
+OLTP systems are optimized for transactional inserts and updates, while OLAP systems are optimized for scans, joins, aggregations, and reporting. This repository treats the CSV input as a source boundary and PostgreSQL schemas as the analytical warehouse boundary. Bronze, Silver, and Gold should not be used as an OLTP transaction-processing layer.
+
+### Warehouse, Lake, and Lakehouse Trade-offs
+
+| Architecture | Strength | Trade-off |
+|---|---|---|
+| Data warehouse | Strong schema, SQL performance, governance, and BI integration | Less flexible for raw unstructured data |
+| Data lake | Low-cost raw storage and flexible schema | Requires additional governance and query-layer discipline |
+| Lakehouse | Combines lake flexibility with warehouse-style tables and governance | More platform and operational complexity |
+
+This project uses PostgreSQL as a local analytical warehouse because the dataset is structured, relational, and consumed through SQL. A data lake would be more appropriate for large volumes of raw files or semi-structured data, while a lakehouse would be suitable when those files also need transactional table semantics and unified analytical access.
+
+### Batch, Micro-batch, Streaming, and CDC Selection Criteria
+
+- **Batch:** appropriate for daily or scheduled reporting where latency of minutes or hours is acceptable. The CSV pipeline currently uses this approach.
+- **Micro-batch:** appropriate when data should arrive every few minutes without the complexity of continuous streaming.
+- **Streaming:** appropriate for event-driven use cases requiring seconds-level latency, such as fraud alerts or operational monitoring.
+- **CDC:** appropriate when changes from an OLTP source must be captured as inserts, updates, and deletes. This repository demonstrates CDC through snapshot comparison because the source is a CSV file rather than a transaction log.
+
+Selection should be driven by SLA, data volume, arrival velocity, source capabilities, replay requirements, data sensitivity, and operating cost—not by product popularity.
+
+### Enterprise Use Case Classification
+
+| Use case | Ingestion pattern | Serving requirement |
+|---|---|---|
+| Daily sales reporting | Batch | Gold warehouse tables and daily/monthly aggregates |
+| Fraud detection | Streaming or micro-batch | Low-latency event and alert serving |
+| Customer profile synchronization | CDC | Upserted dimensions with insert/update/delete history |
+
+### Trust Boundaries and Ownership
+
+```text
+[Source / OLTP owner]
+          |
+          v  trust boundary: controlled extraction
+[Data Engineering ingestion]
+          |
+          v  trust boundary: warehouse access controls
+[Bronze -> Silver -> Gold]
+          |
+          v
+[BI / Analytics consumers]
+```
+
+Ownership is separated as follows:
+
+- **Source/data owner:** owns business meaning and source correctness.
+- **Data engineering:** owns ingestion, transformation, data contracts, and pipeline operation.
+- **Database/platform engineering:** owns PostgreSQL availability, access, backup, and performance.
+- **Data quality owner:** owns quality rules, severity, and acceptance criteria.
+- **BI/analytics consumer:** owns reports, semantic usage, and downstream interpretation.
+- **Security/compliance:** owns classification, retention, access review, and regulatory controls.
+
 The repeatable pipeline in `scripts/run_pipeline.py` supports the following ingestion modes:
 
 ```cmd
